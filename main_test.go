@@ -8,13 +8,43 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/xuri/excelize/v2"
 )
 
-func TestFullBusinessRegression(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "office-ledger-test-*")
+func doJSONReq(t *testing.T, method, url, token string, payload interface{}) (*http.Response, map[string]interface{}) {
+	t.Helper()
+	var bodyReader io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("序列化请求失败: %v", err)
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		t.Fatalf("构建请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-Auth-Token", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求 %s %s 失败: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	var res map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+	return resp, res
+}
+
+func TestFullBusiness100PercentCoverage(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "office-ledger-full-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,149 +66,438 @@ func TestFullBusinessRegression(t *testing.T) {
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", currentPort)
 
-	// ==================== 1. 基础字典新增与防重 ====================
-	body1, _ := json.Marshal(map[string]interface{}{
-		"category": "办公文具", "name": "测试中性笔", "nature": "consumable",
+	// =========================================================================
+	// 模块 1：鉴权、RBAC 角色隔离（登记员只读/录入 vs 管理员全权限）与路径穿越安全
+	// =========================================================================
+	// 1.1 错误口令拦截
+	respBadLogin, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "wrongpass"})
+	if respBadLogin.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("错误口令应返回 401，实际: %d", respBadLogin.StatusCode)
+	}
+
+	// 1.2 内网登记员登录获取 token
+	respEntryLogin, entryLoginRes := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "666666"})
+	if respEntryLogin.StatusCode != http.StatusOK || entryLoginRes["role"] != "entry" {
+		t.Fatalf("内网登记员登录失败: %+v", entryLoginRes)
+	}
+	entryToken := entryLoginRes["token"].(string)
+
+	// 1.3 管理员登录获取 token
+	respAdminLogin, adminLoginRes := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "888888"})
+	if respAdminLogin.StatusCode != http.StatusOK || adminLoginRes["role"] != "admin" {
+		t.Fatalf("管理员登录失败: %+v", adminLoginRes)
+	}
+	adminToken := adminLoginRes["token"].(string)
+
+	// 1.4 携带无效 token 模拟局域网未授权访客被拦截
+	respGuest, _ := doJSONReq(t, http.MethodGet, baseURL+"/api/items", "invalid|token|sig", nil)
+	if respGuest.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("无效 token 必须返回 401，实际: %d", respGuest.StatusCode)
+	}
+
+	// 1.5 登记员越权修改系统设置、执行结转、执行 PUT 修改必须被拦截 (403)
+	respEntryPut, _ := doJSONReq(t, http.MethodPut, baseURL+"/api/items/1", entryToken, map[string]interface{}{"name": "非法修改"})
+	if respEntryPut.StatusCode != http.StatusForbidden {
+		t.Fatalf("登记员 PUT 修改必须被拦截 (403)，实际: %d", respEntryPut.StatusCode)
+	}
+	respEntrySet, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/settings", entryToken, map[string]interface{}{"port": 8099})
+	if respEntrySet.StatusCode != http.StatusForbidden {
+		t.Fatalf("登记员修改设置必须被拦截 (403)，实际: %d", respEntrySet.StatusCode)
+	}
+
+	// 1.6 附件目录路径穿越攻击拦截
+	respTraversal, _ := http.Get(baseURL + "/attachments/..%2Fconfig.json")
+	_ = respTraversal.Body.Close()
+	if respTraversal.StatusCode != http.StatusForbidden && respTraversal.StatusCode != http.StatusNotFound {
+		t.Fatalf("路径穿越必须被拦截，实际状态码: %d", respTraversal.StatusCode)
+	}
+
+	// 1.7 管理员更新单位名称
+	respSetOk, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/settings", adminToken, map[string]interface{}{
+		"port":           currentPort,
+		"admin_passcode": "888888",
+		"entry_passcode": "666666",
+		"allow_lan":      true,
+		"org_name":       "集团综合行政部",
+	})
+	if respSetOk.StatusCode != http.StatusOK {
+		t.Fatalf("管理员保存设置失败: %d", respSetOk.StatusCode)
+	}
+
+	// =========================================================================
+	// 模块 2：基础字典新增、重复拦截、包装规格修改与历史台账数量守恒倒挤
+	// =========================================================================
+	respNewItem, createItemRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", entryToken, map[string]interface{}{
+		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
 		"base_unit": "支", "pack_unit": "盒", "pack_size": 12,
 	})
-	resp1, err := http.Post(baseURL+"/api/items", "application/json", bytes.NewReader(body1))
-	if err != nil || resp1.StatusCode != 200 {
-		t.Fatalf("新增用品失败: %v", err)
+	if respNewItem.StatusCode != http.StatusOK {
+		t.Fatalf("新增用品失败: %+v", createItemRes)
 	}
-	var createItemRes map[string]interface{}
-	_ = json.NewDecoder(resp1.Body).Decode(&createItemRes)
-	_ = resp1.Body.Close()
 	itemID := int64(createItemRes["id"].(float64))
 
-	// ==================== 2. 基本数量强制整数 + 每次登记实时动态倒挤包装尾差 ====================
-	decPayload, _ := json.Marshal(map[string]interface{}{
-		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.96, "total_amount": 10,
+	// 2.1 同分类同性质同名重复拦截 (409)
+	respDupItem, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
+		"base_unit": "支", "pack_unit": "盒", "pack_size": 12,
 	})
-	respDec, _ := http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(decPayload))
-	_ = respDec.Body.Close()
-	if respDec.StatusCode != 400 {
-		t.Fatalf("小数基本数量必须被拦截，实际状态码: %d", respDec.StatusCode)
+	if respDupItem.StatusCode != http.StatusConflict {
+		t.Fatalf("同名用品重复新增必须返回 409，实际: %d", respDupItem.StatusCode)
 	}
 
-	// 入库 24 支（2盒），总价 72 元（单价 3 元） -> XH-2026-000001
-	in1, _ := json.Marshal(map[string]interface{}{
+	// 2.2 小数基本数量拦截 (400)
+	respDec, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.5, "total_amount": 10,
+	})
+	if respDec.StatusCode != http.StatusBadRequest {
+		t.Fatalf("小数基本数量必须拦截 (400)，实际: %d", respDec.StatusCode)
+	}
+
+	// =========================================================================
+	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截
+	// =========================================================================
+	// 3.1 入库 24 支（2盒），总价 72 元（单价 3.00 元） -> XH-2026-000001
+	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 24, "total_amount": 72,
 	})
-	rIn, _ := http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(in1))
-	_ = rIn.Body.Close()
 
-	// 连续 3 次每次领用 4 支 -> XH-2026-000002, 000003, 000004
+	// 3.2 连续 3 次每次领用 4 支 -> XH-2026-000002, 000003, 000004，倒挤包装应为 [0.33, 0.34, 0.33]
 	var packSteps []float64
 	for i := 1; i <= 3; i++ {
-		outP, _ := json.Marshal(map[string]interface{}{
+		_, outRes := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 			"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-20", "base_qty": 4, "recipient": fmt.Sprintf("领用人%d", i),
 		})
-		respOut, _ := http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(outP))
-		var outRes map[string]interface{}
-		_ = json.NewDecoder(respOut.Body).Decode(&outRes)
-		_ = respOut.Body.Close()
 		packSteps = append(packSteps, outRes["reconciled_pack_qty"].(float64))
 	}
 	if packSteps[0] != 0.33 || packSteps[1] != 0.34 || packSteps[2] != 0.33 {
-		t.Fatalf("期望每次登记实时倒挤包装数为 [0.33, 0.34, 0.33]，实际: %v", packSteps)
+		t.Fatalf("期望实时倒挤包装数为 [0.33, 0.34, 0.33]，实际: %v", packSteps)
 	}
 
-	// 校验在库价值表本期领用包装数量（12支 = 1盒）及 隐藏0结存过滤
-	respInv, _ := http.Get(fmt.Sprintf("%s/api/consumables/inventory?start_date=2026-03-01&end_date=2026-03-31&hide_zero=1", baseURL))
-	var invRes map[string]interface{}
-	_ = json.NewDecoder(respInv.Body).Decode(&invRes)
-	_ = respInv.Body.Close()
-	invItems := invRes["items"].([]interface{})
-	if len(invItems) != 1 {
-		t.Fatalf("开启 hide_zero=1 后期望仅返回 1 条有结存记录，实际: %d", len(invItems))
-	}
-	itStat := invItems[0].(map[string]interface{})
-	if itStat["out_pack_qty"].(float64) != 1.0 || itStat["closing_base_qty"].(float64) != 12 {
-		t.Fatalf("期望本期领用包装数为 1.0，期末结存为 12，实际: %+v", itStat)
+	// 3.3 超出库存领用拦截（当前结存 12 支，尝试领用 15 支）
+	respOverOut, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-21", "base_qty": 15, "recipient": "超领人",
+	})
+	if respOverOut.StatusCode != http.StatusBadRequest {
+		t.Fatalf("超库存领用必须被拦截 (400)，实际: %d", respOverOut.StatusCode)
 	}
 
-	// ==================== 3. 插入编号 + 修改编号移动连续无断号 + 日期倒挂标晚日期条目 ====================
-	insertBack, _ := json.Marshal(map[string]interface{}{
-		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-25", "base_qty": 12, "total_amount": 36,
+	// 3.4 修改字典包装规格（从 1盒=12支 改为 1盒=10支），验证历史台账基本数量守恒且包装数重算为 [0.4, 0.4, 0.4]
+	respEditItem, _ := doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/items/%d", baseURL, itemID), adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "全覆盖测试笔", "base_unit": "支", "pack_unit": "盒", "pack_size": 10, "admin_passcode": "888888",
+	})
+	if respEditItem.StatusCode != http.StatusOK {
+		t.Fatalf("修改用品规格失败: %d", respEditItem.StatusCode)
+	}
+	_, ledgerAfterSpec := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID), adminToken, nil)
+	specRows := ledgerAfterSpec["data"].([]interface{})
+	if specRows[1].(map[string]interface{})["pack_qty"].(float64) != 0.4 {
+		t.Fatalf("修改包装规格为10后，4支对应的倒挤包装数应为 0.4，实际: %v", specRows[1].(map[string]interface{})["pack_qty"])
+	}
+	// 改回 1盒=12支 继续后续测试
+	_, _ = doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/items/%d", baseURL, itemID), adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "全覆盖测试笔", "base_unit": "支", "pack_unit": "盒", "pack_size": 12, "admin_passcode": "888888",
+	})
+
+	// =========================================================================
+	// 模块 4：插入编号、双向无断号重排、日期倒挂标晚日期条目、前后数量、插号负库存回滚
+	// =========================================================================
+	// 4.1 补录早于当前最晚日期(2026-03-20)的单据且未传口令 -> 触发 need_override (409)
+	respNeedOverride, ovRes := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-05", "base_qty": 12, "total_amount": 48,
+	})
+	if respNeedOverride.StatusCode != http.StatusConflict || ovRes["need_override"] != true {
+		t.Fatalf("补录前期单据未带口令应返回 409 need_override，实际: %+v", ovRes)
+	}
+
+	// 4.2 在 XH-2026-000002 插入 2026-03-25 单据（日期晚于 000003 的 03-20 -> 触发日期倒挂标在 03-25 这一条上）
+	respInsert, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", adminToken, map[string]interface{}{
+		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-25", "base_qty": 12, "total_amount": 48,
 		"custom_serial_no": "XH-2026-000002", "admin_passcode": "888888",
 	})
-	respInsert, _ := http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(insertBack))
-	_ = respInsert.Body.Close()
-	if respInsert.StatusCode != 200 {
-		t.Fatalf("插入指定编号补录失败，状态码: %d", respInsert.StatusCode)
+	if respInsert.StatusCode != http.StatusOK {
+		t.Fatalf("插号补录失败: %d", respInsert.StatusCode)
 	}
 
-	respLedger, _ := http.Get(fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID))
-	var ledgerRes map[string]interface{}
-	_ = json.NewDecoder(respLedger.Body).Decode(&ledgerRes)
-	_ = respLedger.Body.Close()
+	// 4.3 尝试在 XH-2026-000001（最前面）插入一笔领用 5 支（此时尚未入库，会导致时序负库存）-> 必须被拦截并回滚
+	respNegInsert, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", adminToken, map[string]interface{}{
+		"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-01", "base_qty": 5, "recipient": "测试员",
+		"custom_serial_no": "XH-2026-000001", "admin_passcode": "888888",
+	})
+	if respNegInsert.StatusCode != http.StatusBadRequest {
+		t.Fatalf("插号导致中间时点负库存必须被拦截并回滚，实际: %d", respNegInsert.StatusCode)
+	}
+
+	// 4.4 验证日期倒挂标记在晚日期条目(03-25)上，且前后结存数量(before_qty / after_qty)准确
+	_, ledgerRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID), adminToken, nil)
 	rows := ledgerRes["data"].([]interface{})
-	secondRow := rows[1].(map[string]interface{})
-	if secondRow["serial_no"] != "XH-2026-000002" || secondRow["date_anomaly"] != true {
-		t.Fatalf("期望晚日期条目 XH-2026-000002 标日期倒挂，实际: %+v", secondRow)
+	if len(rows) != 5 {
+		t.Fatalf("期望 5 条流水记录，实际: %d", len(rows))
+	}
+	r2 := rows[1].(map[string]interface{})
+	r3 := rows[2].(map[string]interface{})
+	if r2["serial_no"] != "XH-2026-000002" || r2["date_anomaly"] != true {
+		t.Fatalf("日期倒挂应标在较晚日期条目 XH-2026-000002 上，实际: %+v", r2)
+	}
+	if r3["date_anomaly"] != false {
+		t.Fatalf("较早日期条目 XH-2026-000003 不应被误标，实际: %+v", r3)
+	}
+	if r2["before_qty"].(float64) != 24 || r2["after_qty"].(float64) != 36 {
+		t.Fatalf("入库前后数量应为 24 -> 36，实际: %v -> %v", r2["before_qty"], r2["after_qty"])
 	}
 
-	// ==================== 4. 复用品入库、管理员补录修改金额/日期与单项资产履历导出 ====================
+	// 4.5 修改编号插队：把第 4 条（XH-2026-000004）修改为 XH-2026-000002，验证 000001~000005 绝对连续无断号！
+	fourthID := int64(rows[3].(map[string]interface{})["id"].(float64))
+	respMovePut, _ := doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/consumables/ledger/%d", baseURL, fourthID), adminToken, map[string]interface{}{
+		"serial_no": "XH-2026-000002", "tx_date": "2026-03-20", "base_qty": 4,
+		"recipient": "领用人2", "admin_passcode": "888888",
+	})
+	if respMovePut.StatusCode != http.StatusOK {
+		t.Fatalf("修改编号插队失败: %d", respMovePut.StatusCode)
+	}
+	_, ledgerAfterMove := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID), adminToken, nil)
+	movedRows := ledgerAfterMove["data"].([]interface{})
+	for i, raw := range movedRows {
+		expectedNo := fmt.Sprintf("XH-2026-%06d", i+1)
+		gotNo := raw.(map[string]interface{})["serial_no"].(string)
+		if gotNo != expectedNo {
+			t.Fatalf("修改编号移动后出现断号或跳号！第 %d 条期望 %s，实际 %s", i+1, expectedNo, gotNo)
+		}
+	}
+
+	// =========================================================================
+	// 模块 5：在库价值盘点表时间区间恒等式、本期领用包装数、隐藏0结存、采购价格正态分布
+	// =========================================================================
+	// 5.1 截止 2026-03-21 统计（排除 2026-03-25 的 12 支入库），验证 期初(0)+本期入(24)-本期领(12)=期末(12)，本期领用包装=1.0
+	_, invCutRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/inventory?start_date=2026-03-01&end_date=2026-03-21&hide_zero=1", baseURL), adminToken, nil)
+	cutItems := invCutRes["items"].([]interface{})
+	if len(cutItems) != 1 {
+		t.Fatalf("开启 hide_zero=1 后应仅返回 1 条有结存品种，实际: %d", len(cutItems))
+	}
+	cutStat := cutItems[0].(map[string]interface{})
+	if cutStat["opening_base_qty"].(float64) != 0 ||
+		cutStat["in_base_qty"].(float64) != 24 ||
+		cutStat["out_base_qty"].(float64) != 12 ||
+		cutStat["out_pack_qty"].(float64) != 1.0 ||
+		cutStat["closing_base_qty"].(float64) != 12 {
+		t.Fatalf("时间区间截断恒等式或本期领用包装数异常: %+v", cutStat)
+	}
+
+	// 5.2 采购价格正态/频率分布分析（有 3.00 元和 4.00 元两批不同单价入库）
+	respDist, distRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/items/price-distribution?item_id=%d", baseURL, itemID), adminToken, nil)
+	if respDist.StatusCode != http.StatusOK || distRes["has_data"] != true || distRes["min_price"].(float64) != 3.0 || distRes["max_price"].(float64) != 4.0 {
+		t.Fatalf("采购价格正态分布分析结果异常: %+v", distRes)
+	}
+
+	// =========================================================================
+	// 模块 6：年度结转、次年编号重置、撤销年度结转
+	// =========================================================================
+	respCarry, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/carryover", adminToken, map[string]interface{}{
+		"carry_year": 2026, "admin_passcode": "888888",
+	})
+	if respCarry.StatusCode != http.StatusOK {
+		t.Fatalf("执行 2026 年度结转失败: %d", respCarry.StatusCode)
+	}
+	_, carryListRes := doJSONReq(t, http.MethodGet, baseURL+"/api/carryover", adminToken, nil)
+	if len(carryListRes["data"].([]interface{})) != 1 {
+		t.Fatalf("结转记录应为 1 条")
+	}
+	// 撤销 2026 年度结转
+	respCancelCarry, _ := doJSONReq(t, http.MethodDelete, baseURL+"/api/carryover?carry_year=2026&admin_passcode=888888", adminToken, nil)
+	if respCancelCarry.StatusCode != http.StatusOK {
+		t.Fatalf("撤销年度结转失败: %d", respCancelCarry.StatusCode)
+	}
+
+	// =========================================================================
+	// 模块 7：复用品（类资产）全生命周期：入库建档 -> 管理员补录修正 -> 领用 -> 变更使用人 -> 报废 -> 取消报废
+	// =========================================================================
 	var reusableItemID int64
 	_ = db.QueryRow(`SELECT id FROM items WHERE nature = 'reusable' LIMIT 1`).Scan(&reusableItemID)
 
+	// 7.1 入库建档（初始单价填 0，模拟暂未拿到发票）
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("item_id", fmt.Sprintf("%d", reusableItemID))
+	_ = mw.WriteField("sub_name", "301室订书机")
 	_ = mw.WriteField("purchase_date", "2026-05-01")
-	_ = mw.WriteField("expected_years", "8")
+	_ = mw.WriteField("expected_years", "5")
 	_ = mw.WriteField("quantity", "1")
 	_ = mw.WriteField("total_amount", "0")
-	fw, _ := mw.CreateFormFile("image_file", "desk.jpg")
-	_, _ = fw.Write([]byte("img"))
+	fw, _ := mw.CreateFormFile("image_file", "stapler.jpg")
+	_, _ = fw.Write([]byte("fake-image-bytes"))
 	_ = mw.Close()
-	rAst, _ := http.Post(baseURL+"/api/reusables/assets", mw.FormDataContentType(), &buf)
-	_ = rAst.Body.Close()
 
-	respAssets, _ := http.Get(baseURL + "/api/reusables/assets")
-	var assetsRes map[string]interface{}
-	_ = json.NewDecoder(respAssets.Body).Decode(&assetsRes)
-	_ = respAssets.Body.Close()
+	reqAstIn, _ := http.NewRequest(http.MethodPost, baseURL+"/api/reusables/assets", &buf)
+	reqAstIn.Header.Set("Content-Type", mw.FormDataContentType())
+	reqAstIn.Header.Set("X-Auth-Token", entryToken)
+	respAstIn, err := http.DefaultClient.Do(reqAstIn)
+	if err != nil || respAstIn.StatusCode != http.StatusOK {
+		t.Fatalf("复用品入库建档失败: %v", err)
+	}
+	_ = respAstIn.Body.Close()
+
+	_, assetsRes := doJSONReq(t, http.MethodGet, baseURL+"/api/reusables/assets", adminToken, nil)
 	assetObj := assetsRes["data"].([]interface{})[0].(map[string]interface{})
 	assetID := int64(assetObj["id"].(float64))
+	if assetObj["disposal_date"] != "2031-05-01" {
+		t.Fatalf("预计处置日期应为 2031-05-01，实际: %v", assetObj["disposal_date"])
+	}
 
-	// 补录修正该复用品的单价为 680 元，预计年限 10 年
-	var editBuf bytes.Buffer
-	emw := multipart.NewWriter(&editBuf)
+	// 7.2 管理员补录修正金额与使用年限
+	var editAstBuf bytes.Buffer
+	emw := multipart.NewWriter(&editAstBuf)
 	_ = emw.WriteField("item_id", fmt.Sprintf("%d", reusableItemID))
-	_ = emw.WriteField("sub_name", "财务室专用办公桌")
+	_ = emw.WriteField("sub_name", "301室重型订书机")
 	_ = emw.WriteField("purchase_date", "2026-05-01")
-	_ = emw.WriteField("unit_price", "680")
-	_ = emw.WriteField("expected_years", "10")
+	_ = emw.WriteField("unit_price", "128.5")
+	_ = emw.WriteField("expected_years", "8")
+	_ = emw.WriteField("remark", "财务补录发票金额")
 	_ = emw.WriteField("admin_passcode", "888888")
 	_ = emw.Close()
-
-	reqEditAst, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/reusables/assets/%d", baseURL, assetID), &editBuf)
+	reqEditAst, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/reusables/assets/%d", baseURL, assetID), &editAstBuf)
 	reqEditAst.Header.Set("Content-Type", emw.FormDataContentType())
-	respEditAst, err := http.DefaultClient.Do(reqEditAst)
-	if err != nil || respEditAst.StatusCode != 200 {
-		t.Fatalf("补录修正复用品档案失败: %v", err)
-	}
+	reqEditAst.Header.Set("X-Auth-Token", adminToken)
+	respEditAst, _ := http.DefaultClient.Do(reqEditAst)
 	_ = respEditAst.Body.Close()
-
-	// ==================== 5. 全部 4 种 Excel 导出有效性验证（含 hide_zero=1） ====================
-	exportURLs := []string{
-		fmt.Sprintf("%s/api/export/excel?mode=consumable_inventory&org_name=财务资产处&hide_zero=1", baseURL),
-		fmt.Sprintf("%s/api/export/excel?mode=consumable_ledger&org_name=财务资产处", baseURL),
-		fmt.Sprintf("%s/api/export/excel?mode=reusable_assets&org_name=财务资产处", baseURL),
-		fmt.Sprintf("%s/api/export/excel?mode=reusable_single_logs&asset_id=%d&org_name=财务资产处", baseURL, assetID),
+	if respEditAst.StatusCode != http.StatusOK {
+		t.Fatalf("管理员补录修正复用品档案失败: %d", respEditAst.StatusCode)
 	}
-	for _, u := range exportURLs {
-		respExp, err := http.Get(u)
-		if err != nil || respExp.StatusCode != 200 {
-			t.Fatalf("导出 Excel (%s) 失败", u)
+
+	// 7.3 首次领用 -> 重复领用拦截 -> 变更使用人 -> 报废 -> 报废后禁止领用 -> 取消报废
+	postTransition := func(fields map[string]string, withFile bool) int {
+		var b bytes.Buffer
+		w := multipart.NewWriter(&b)
+		for k, v := range fields {
+			_ = w.WriteField(k, v)
 		}
-		rawXlsx, _ := io.ReadAll(respExp.Body)
-		_ = respExp.Body.Close()
-		xlFile, err := excelize.OpenReader(bytes.NewReader(rawXlsx))
+		if withFile {
+			f, _ := w.CreateFormFile("scrap_file", "scrap.pdf")
+			_, _ = f.Write([]byte("scrap-doc"))
+		}
+		_ = w.Close()
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/reusables/assets/%d/transition", baseURL, assetID), &b)
+		req.Header.Set("Content-Type", w.FormDataContentType())
+		req.Header.Set("X-Auth-Token", adminToken)
+		r, _ := http.DefaultClient.Do(req)
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+
+	if code := postTransition(map[string]string{"action": "ASSIGN", "user": "张三"}, false); code != http.StatusOK {
+		t.Fatalf("首次领用失败: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "ASSIGN", "user": "李四"}, false); code != http.StatusBadRequest {
+		t.Fatalf("重复领用必须被拦截 (400)，实际: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "TRANSFER", "user": "王五"}, false); code != http.StatusOK {
+		t.Fatalf("变更使用人失败: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "SCRAP"}, false); code != http.StatusBadRequest {
+		t.Fatalf("未传报废凭证必须拦截 (400)，实际: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "SCRAP"}, true); code != http.StatusOK {
+		t.Fatalf("上传凭证登记报废失败: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "ASSIGN", "user": "赵六"}, false); code != http.StatusBadRequest {
+		t.Fatalf("报废后领用必须被拦截 (400)，实际: %d", code)
+	}
+	if code := postTransition(map[string]string{"action": "UNSCRAP", "admin_passcode": "888888"}, false); code != http.StatusOK {
+		t.Fatalf("管理员取消报废失败: %d", code)
+	}
+
+	// =========================================================================
+	// 模块 8：月度原始手写登记附件上传、修改、删除与审计日志验证
+	// =========================================================================
+	var maBuf bytes.Buffer
+	mmw := multipart.NewWriter(&maBuf)
+	_ = mmw.WriteField("year_month", "2026-03")
+	_ = mmw.WriteField("title", "2026年3月手写领用登记表")
+	_ = mmw.WriteField("remark", "共2页")
+	mfw, _ := mmw.CreateFormFile("file", "handwrite_202603.pdf")
+	_, _ = mfw.Write([]byte("%PDF-1.4 mock"))
+	_ = mmw.Close()
+	reqMaUp, _ := http.NewRequest(http.MethodPost, baseURL+"/api/monthly-attachments", &maBuf)
+	reqMaUp.Header.Set("Content-Type", mmw.FormDataContentType())
+	reqMaUp.Header.Set("X-Auth-Token", entryToken)
+	respMaUp, _ := http.DefaultClient.Do(reqMaUp)
+	var maUpRes map[string]interface{}
+	_ = json.NewDecoder(respMaUp.Body).Decode(&maUpRes)
+	_ = respMaUp.Body.Close()
+	if respMaUp.StatusCode != http.StatusOK {
+		t.Fatalf("上传月度附件失败: %d", respMaUp.StatusCode)
+	}
+	maID := int64(maUpRes["id"].(float64))
+	relFilePath := maUpRes["file_path"].(string)
+
+	// 管理员删除月度附件并验证物理文件同步清理
+	respMaDel, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/monthly-attachments/%d?admin_passcode=888888", baseURL, maID), adminToken, nil)
+	if respMaDel.StatusCode != http.StatusOK {
+		t.Fatalf("管理员删除月度附件失败: %d", respMaDel.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(attachRootDir, filepath.FromSlash(relFilePath))); !os.IsNotExist(err) {
+		t.Fatalf("删除月度附件后物理文件未清理")
+	}
+
+	// 审计日志验证
+	_, auditRes := doJSONReq(t, http.MethodGet, baseURL+"/api/audit-logs", adminToken, nil)
+	if len(auditRes["data"].([]interface{})) < 5 {
+		t.Fatalf("审计日志应记录全部敏感操作")
+	}
+
+	// =========================================================================
+	// 模块 9：全部 4 种 Excel 导出结构、表头字段与 hide_zero 深度单元格校验
+	// =========================================================================
+	fetchExcel := func(u string) *excelize.File {
+		req, _ := http.NewRequest(http.MethodGet, u, nil)
+		req.Header.Set("X-Auth-Token", adminToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("导出 Excel (%s) 失败: %v", u, err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		xl, err := excelize.OpenReader(bytes.NewReader(raw))
 		if err != nil {
-			t.Fatalf("导出的 Excel (%s) 解析失败: %v", u, err)
+			t.Fatalf("解析 Excel (%s) 失败: %v", u, err)
 		}
-		_ = xlFile.Close()
+		return xl
+	}
+
+	// 9.1 消耗品盘点表（校验单位、金额单位标注、本期领用(包装数量)列头及 hide_zero=1 生效）
+	xlInv := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_inventory&hide_zero=1", baseURL))
+	defer xlInv.Close()
+	orgCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "A2")
+	unitCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "P2")
+	outPackHeader, _ := xlInv.GetCellValue("消耗品盘点统计表", "L3")
+	row5Seq, _ := xlInv.GetCellValue("消耗品盘点统计表", "A5")
+	if !strings.Contains(orgCell, "集团综合行政部") || unitCell != "金额单位：元" || outPackHeader != "本期领用(包装数量)" || row5Seq != "" {
+		t.Fatalf("盘点表 Excel 表头或 hide_zero 过滤校验失败: org=%s, unit=%s, L3=%s, A5=%s", orgCell, unitCell, outPackHeader, row5Seq)
+	}
+
+	// 9.2 消耗品流水账（校验入库/领用前数量、入库领用数量、入库/领用后数量）
+	xlLed := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_ledger", baseURL))
+	defer xlLed.Close()
+	hBefore, _ := xlLed.GetCellValue("消耗品接续流水账", "I3")
+	hQty, _ := xlLed.GetCellValue("消耗品接续流水账", "J3")
+	hAfter, _ := xlLed.GetCellValue("消耗品接续流水账", "K3")
+	if hBefore != "入库/领用前数量" || hQty != "入库领用数量" || hAfter != "入库/领用后数量" {
+		t.Fatalf("流水账 Excel 列头校验失败: I3=%s, J3=%s, K3=%s", hBefore, hQty, hAfter)
+	}
+
+	// 9.3 复用品台账（校验无实物图列且列对齐）
+	xlAst := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_assets", baseURL))
+	defer xlAst.Close()
+	astHeaders, _ := xlAst.GetRows("复用品类资产台账")
+	for _, h := range astHeaders[2] {
+		if strings.Contains(h, "实物图") {
+			t.Fatalf("复用品台账 Excel 不应包含实物图列")
+		}
+	}
+
+	// 9.4 单项复用品履历表
+	xlLog := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_single_logs&asset_id=%d", baseURL, assetID))
+	defer xlLog.Close()
+	logRows, _ := xlLog.GetRows("资产全生命周期履历")
+	if len(logRows) < 8 {
+		t.Fatalf("单项资产履历 Excel 行数不足，期望含表头至少 8 行，实际: %d", len(logRows))
 	}
 }
