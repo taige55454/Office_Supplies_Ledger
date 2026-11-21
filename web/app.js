@@ -119,7 +119,7 @@ function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
 }
 
-// ==================== 1. 基础用品字典管理 ====================
+// ==================== 1. 用品库管理（含修改与权限删除） ====================
 
 function openDictModal() {
   renderDictTable();
@@ -170,8 +170,9 @@ function renderDictTable() {
     const priceBtn = it.nature === 'consumable' && it.min_price > 0
       ? `<button class="price-link" onclick="openPriceDistModal(${it.id})">${priceTxt} 📊</button>`
       : priceTxt;
-    const editBtn = authState.role === 'admin'
-      ? `<button class="btn btn-sm btn-outline" onclick="openEditItemModal(${it.id})">✏️ 修改</button>`
+    const opsHtml = authState.role === 'admin'
+      ? `<button class="btn btn-sm btn-outline" onclick="openEditItemModal(${it.id})">✏️ 修改</button> ` +
+        `<button class="btn btn-sm btn-danger" onclick="deleteDictItem(${it.id}, '${it.name.replace(/'/g, "\\'")}')">🗑️ 删除</button>`
       : `<span class="hint-text">只读</span>`;
     return `
       <tr>
@@ -183,9 +184,25 @@ function renderDictTable() {
         <td>${spec}</td>
         <td>${stockTxt}</td>
         <td>${priceBtn}</td>
-        <td>${editBtn}</td>
+        <td style="white-space:nowrap;">${opsHtml}</td>
       </tr>`;
   }).join('');
+}
+
+async function deleteDictItem(id, name) {
+  const pass = prompt(`删除用品库条目【${name}】需要管理员最高权限确认，请输入管理员口令：`);
+  if (!pass) return;
+  const resp = await apiFetch(`/api/items/${id}?admin_passcode=${encodeURIComponent(pass)}`, {
+    method: 'DELETE'
+  });
+  const res = await resp.json();
+  if (!res.success) {
+    alert(res.message);
+    return;
+  }
+  alert(res.message);
+  await loadItems();
+  await loadConsumableData();
 }
 
 function openNewItemModal() {
@@ -315,7 +332,7 @@ function onTxItemChange() {
   const spec = it.pack_unit ? `1 ${it.pack_unit} = ${it.pack_size} ${it.base_unit}` : `最小单位：${it.base_unit}`;
   document.getElementById('tx-item-spec-banner').innerHTML =
     `规格：<strong>${spec}</strong> &nbsp;|&nbsp; 当前可用结存：<strong>${it.stock_qty} ${it.base_unit}</strong> &nbsp;|&nbsp; 在库价值：<strong>${(it.stock_value || 0).toFixed(2)} 元</strong>`;
-  document.getElementById('tx-base-label').textContent = `入库领用数量 (${it.base_unit}，必须为整数) *`;
+  document.getElementById('tx-base-label').textContent = `入库/领用数量 (${it.base_unit}，必须为整数) *`;
   document.getElementById('tx-pack-label').textContent = `参考包装数量 (${it.pack_unit || '件'}，填写可自动算基本数量)`;
   onBaseQtyInput();
 }
@@ -337,7 +354,7 @@ function onBaseQtyInput() {
 
   const warnEl = document.getElementById('tx-pack-warning');
   if (it.pack_size > 1 && bQty % it.pack_size !== 0) {
-    warnEl.textContent = `💡 提示：${bQty} ${it.base_unit} 折合约 ${pQty} ${it.pack_unit}，记账时系统自动执行累计包装尾差倒挤对齐。`;
+    warnEl.textContent = `💡 提示：${bQty} ${it.base_unit} 折合约 ${pQty} ${it.pack_unit}，记账时系统自动执行累计包装尾差折算对齐。`;
     warnEl.classList.remove('hidden');
   } else {
     warnEl.classList.add('hidden');
@@ -384,7 +401,7 @@ async function submitConsumableTx() {
   const rawQty = document.getElementById('tx-base-qty').value;
   const bQty = Number(rawQty);
   if (!rawQty || !Number.isInteger(bQty) || bQty <= 0) {
-    alert('入库领用数量必须为大于 0 的整数！');
+    alert('入库/领用数量必须为大于 0 的整数！');
     return;
   }
 
@@ -443,7 +460,7 @@ async function loadConsumableData() {
 
   catCards.innerHTML = `
     <div class="stat-card" style="border-left:4px solid #2563eb;">
-      <div class="stat-title">💰 全部在库物资实时总价值 (元)</div>
+      <div class="stat-title">💰 在库物资历史价值 (元)</div>
       <div class="stat-val" style="color:#1d4ed8;">${totalStockValue.toFixed(2)}</div>
     </div>
   ` + (res.category_summary || []).map(c => `
@@ -579,7 +596,7 @@ async function submitEditLedger() {
   const id = document.getElementById('edit-ledger-id').value;
   const bQty = Number(document.getElementById('edit-ledger-qty').value);
   if (!Number.isInteger(bQty) || bQty <= 0) {
-    alert('入库领用数量必须为正整数！');
+    alert('入库/领用数量必须为正整数！');
     return;
   }
   const payload = {
@@ -674,7 +691,7 @@ async function openPriceDistModal(itemID) {
   document.getElementById('modal-price-dist').classList.remove('hidden');
 }
 
-// ==================== 5. 复用品（类资产全生命周期 + 管理员补录修改 + 预计处置日期 + 履历打印导出） ====================
+// ==================== 5. 复用品（类资产全生命周期） ====================
 
 function openReusableInModal() {
   const reusables = allItems.filter(i => i.nature === 'reusable');
@@ -1123,7 +1140,7 @@ async function loadAuditLogs() {
   `).join('');
 }
 
-// ==================== 8. 自定义打印（右上角金额单位：元 + 所有列缩放到一页 + 隐藏0结存选项） ====================
+// ==================== 8. 自定义打印 ====================
 
 function openPrintPreview(mode) {
   currentPrintMode = mode;
