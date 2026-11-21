@@ -91,7 +91,7 @@
       <!-- 分类汇总卡片 -->
       <div id="consumable-cat-cards" class="summary-cards"></div>
 
-      <!-- 盘点统计表（带独立垂直滚动滑块与纯数字规范列） -->
+      <!-- 盘点统计表 -->
       <div class="card">
         <div class="card-header">
           <h3>📊 消耗品期初 / 期末盘点与移动加权在库价值表</h3>
@@ -107,15 +107,15 @@
                 <th>基本单位</th>
                 <th>包装单位</th>
                 <th>包装规格</th>
-                <th>期初结存(基本数量)</th>
-                <th>期初结存(包装数量)</th>
-                <th>本期入库(基本数量)</th>
-                <th>本期入库(包装数量)</th>
-                <th>本期领用(基本数量)</th>
-                <th>期末结存(基本数量)</th>
-                <th>期末结存(包装数量)</th>
-                <th>平均价</th>
-                <th>当前在库价值</th>
+                <th class="col-qty">期初结存<br/>(基本数量)</th>
+                <th class="col-qty">期初结存<br/>(包装数量)</th>
+                <th class="col-qty">本期入库<br/>(基本数量)</th>
+                <th class="col-qty">本期入库<br/>(包装数量)</th>
+                <th class="col-qty">本期领用<br/>(基本数量)</th>
+                <th class="col-qty">期末结存<br/>(基本数量)</th>
+                <th class="col-qty">期末结存<br/>(包装数量)</th>
+                <th class="col-money">平均价</th>
+                <th class="col-money">当前在库价值</th>
                 <th>采购价格分布</th>
               </tr>
             </thead>
@@ -124,7 +124,7 @@
         </div>
       </div>
 
-      <!-- 接续流水账（带独立垂直滚动滑块、按流水编号排序、日期错乱预警） -->
+      <!-- 接续流水账 -->
       <div class="card" style="margin-top: 18px;">
         <div class="card-header">
           <h3>🧾 消耗品入库与领用接续流水账（按流水编号排序）</h3>
@@ -150,10 +150,12 @@
                 <th>包装单位</th>
                 <th>包装规格</th>
                 <th>类型</th>
-                <th>基本数量</th>
-                <th>倒挤包装数</th>
-                <th>采购/领用金额</th>
-                <th>单价</th>
+                <th class="col-qty">入库/领用<br/>前数量</th>
+                <th class="col-qty">基本数量</th>
+                <th class="col-qty">入库/领用<br/>后数量</th>
+                <th class="col-qty">倒挤<br/>包装数</th>
+                <th class="col-money">采购/领用<br/>金额</th>
+                <th class="col-money">单价</th>
                 <th>领用人</th>
                 <th>备注</th>
                 <th class="no-print">操作</th>
@@ -214,10 +216,10 @@
                 <th>分类</th>
                 <th>标准品名</th>
                 <th>二级品名/位置</th>
-                <th>实物图</th>
+                <th class="no-print">实物图</th>
                 <th>购置日期</th>
-                <th>单价</th>
-                <th>预计年限(年)</th>
+                <th class="col-money">单价</th>
+                <th class="col-qty">预计年限<br/>(年)</th>
                 <th>预计处置日期</th>
                 <th>当前状态</th>
                 <th>当前使用人</th>
@@ -331,7 +333,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 1: 消耗品入库 / 领用登记（双向辅助填写 + 插入顺延编号） ==================== -->
+  <!-- ==================== 弹窗 1: 消耗品入库 / 领用登记 ==================== -->
   <div id="modal-consumable-tx" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
@@ -383,7 +385,7 @@
           <div class="form-grid" style="margin-bottom:0;">
             <div class="form-group" style="margin-bottom:0;">
               <label>指定插入的流水编号（选填，留空则追加末尾）</label>
-              <input type="text" id="tx-custom-serial" class="form-control" placeholder="如 XH-2026-000002（后续自动顺延）" />
+              <input type="text" id="tx-custom-serial" class="form-control" placeholder="如 XH-2026-000002（自动连续重排）" />
             </div>
             <div class="form-group" style="margin-bottom:0;">
               <label>管理员最高权限确认口令 *</label>
@@ -404,11 +406,11 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 2: 修改消耗品流水记录（支持修改编号顺延 + 包装辅助换算） ==================== -->
+  <!-- ==================== 弹窗 2: 修改消耗品流水记录 ==================== -->
   <div id="modal-edit-ledger" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>✏️ 修正消耗品流水记录（支持调整编号顺延）</h3>
+        <h3>✏️ 修正消耗品流水记录（支持调整编号连续重排）</h3>
         <button class="close-btn" onclick="closeModal('modal-edit-ledger')">×</button>
       </div>
       <div class="modal-body">
@@ -417,7 +419,7 @@
         <div id="edit-ledger-info" class="info-banner"></div>
         <div class="form-grid">
           <div class="form-group">
-            <label>流水编号（修改后该年后续编号自动顺延）</label>
+            <label>流水编号（调整后全年度序号自动连续重排）</label>
             <input type="text" id="edit-ledger-serial" class="form-control" placeholder="如 XH-2026-000001" />
           </div>
           <div class="form-group">
@@ -503,7 +505,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 4: 修改基础用品字典（数量守恒折算） ==================== -->
+  <!-- ==================== 弹窗 4: 修改基础用品字典 ==================== -->
   <div id="modal-edit-item" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
@@ -547,7 +549,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 5: 复用品入库建档（一物一码 + 强制实物图） ==================== -->
+  <!-- ==================== 弹窗 5: 复用品入库建档 ==================== -->
   <div id="modal-reusable-in" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
@@ -598,7 +600,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 6: 复用品状态流转（首次领用 / 变更使用人 / 报废 / 取消报废） ==================== -->
+  <!-- ==================== 弹窗 6: 复用品状态流转 ==================== -->
   <div id="modal-reusable-transition" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
@@ -639,7 +641,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 7: 复用品全生命周期履历查看（支持打印与导出 Excel） ==================== -->
+  <!-- ==================== 弹窗 7: 复用品全生命周期履历查看 ==================== -->
   <div id="modal-reusable-logs" class="modal hidden">
     <div class="modal-box" style="max-width:860px;">
       <div class="modal-header">
@@ -739,7 +741,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 10: 系统设置（单位名称 + 端口 + 双口令） ==================== -->
+  <!-- ==================== 弹窗 10: 系统设置 ==================== -->
   <div id="modal-settings" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
@@ -792,7 +794,7 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 12: 自定义打印预览（右上角金额单位：元 + 所有列缩放到一页） ==================== -->
+  <!-- ==================== 弹窗 12: 自定义打印预览 ==================== -->
   <div id="modal-print-preview" class="modal hidden">
     <div class="modal-box" style="max-width:1160px;width:96%;">
       <div class="modal-header no-print">
