@@ -139,7 +139,11 @@ func saveConfigToFile() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, b, 0644)
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, b, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, configPath)
 }
 
 // ==================== 2. 数据库初始化与预置字典 ====================
@@ -150,8 +154,9 @@ func initDatabase() error {
 	if err != nil {
 		return err
 	}
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS items (
@@ -311,7 +316,7 @@ func autoDailyBackup() {
 	_, _ = db.Exec(fmt.Sprintf(`VACUUM INTO '%s'`, strings.ReplaceAll(dest, "'", "''")))
 }
 
-// ==================== 3. 通用工具函数、流水编号插入顺延、动态包装倒挤与移动加权成本引擎 ====================
+// ==================== 3. 通用工具函数、全年度连续无断号重排引擎、动态包装倒挤与移动加权成本引擎 ====================
 
 func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
@@ -391,49 +396,88 @@ func parseConsumableSerialNo(serialNo string) (int, int, bool) {
 	return y, seq, true
 }
 
-// 编号插入顺延工具：当在 year 年的 targetSeq 位置插入新记录时，将该年份 >= targetSeq 的现有记录整体后移 1 位（< targetSeq 的保持不变）
-func shiftConsumableSerialsFrom(tx *sql.Tx, year int, targetSeq int, excludeID int64) error {
+// 全年度连续无断号重排引擎：
+// 将 focusID 插入到 year 年度的 desiredSeq 位置，自动闭合移动留下的空位并顺延后续序号，保证 1..N 绝对连续无断号！
+func resequenceConsumableYear(tx *sql.Tx, year int, focusID int64, desiredSeq int) (string, error) {
 	rows, err := tx.Query(`
 		SELECT id, seq_num, serial_no
 		FROM consumable_ledger
-		WHERE ledger_year = ? AND seq_num >= ? AND id != ?
-		ORDER BY seq_num DESC`, year, targetSeq, excludeID)
+		WHERE ledger_year = ?
+		ORDER BY seq_num ASC, id ASC`, year)
 	if err != nil {
-		return err
+		return "", err
 	}
-	type shiftItem struct {
-		id     int64
-		oldSeq int
-		oldNo  string
+	type seqNode struct {
+		id    int64
+		oldNo string
 	}
-	var list []shiftItem
+	var others []seqNode
+	var focusNode *seqNode
+
 	for rows.Next() {
-		var it shiftItem
-		if err := rows.Scan(&it.id, &it.oldSeq, &it.oldNo); err == nil {
-			list = append(list, it)
+		var id int64
+		var sNum int
+		var sNo string
+		if err := rows.Scan(&id, &sNum, &sNo); err == nil {
+			if id == focusID {
+				focusNode = &seqNode{id: id, oldNo: sNo}
+			} else {
+				others = append(others, seqNode{id: id, oldNo: sNo})
+			}
 		}
 	}
 	rows.Close()
 
-	// 先移至临时编号避免 UNIQUE 冲突，再落位为连续编号
-	for _, it := range list {
-		tmpNo := fmt.Sprintf("TMP-%d-%d", it.id, it.oldSeq)
-		if _, err := tx.Exec(`UPDATE consumable_ledger SET serial_no = ? WHERE id = ?`, tmpNo, it.id); err != nil {
-			return err
+	ordered := make([]seqNode, 0, len(others)+1)
+	if focusNode != nil {
+		insertIdx := desiredSeq - 1
+		if insertIdx < 0 {
+			insertIdx = 0
+		}
+		if insertIdx > len(others) {
+			insertIdx = len(others)
+		}
+		ordered = append(ordered, others[:insertIdx]...)
+		ordered = append(ordered, *focusNode)
+		ordered = append(ordered, others[insertIdx:]...)
+	} else {
+		ordered = others
+	}
+
+	// 第一阶段：全部设为临时编号，彻底避免 UNIQUE 约束冲突
+	for idx, node := range ordered {
+		tmpNo := fmt.Sprintf("RESEQ-TMP-%d-%d", year, idx+1)
+		if _, err := tx.Exec(`UPDATE consumable_ledger SET serial_no = ? WHERE id = ?`, tmpNo, node.id); err != nil {
+			return "", err
 		}
 	}
-	for _, it := range list {
-		newSeq := it.oldSeq + 1
+
+	// 第二阶段：落位为 1..N 连续编号，并同步重命名受影响的物理附件
+	finalFocusSerial := ""
+	type renamePair struct{ oldPrefix, newPrefix string }
+	var renames []renamePair
+
+	for idx, node := range ordered {
+		newSeq := idx + 1
 		newNo := fmt.Sprintf("XH-%d-%06d", year, newSeq)
-		if _, err := tx.Exec(`UPDATE consumable_ledger SET seq_num = ?, serial_no = ? WHERE id = ?`, newSeq, newNo, it.id); err != nil {
-			return err
+		if _, err := tx.Exec(`UPDATE consumable_ledger SET seq_num = ?, serial_no = ? WHERE id = ?`, newSeq, newNo, node.id); err != nil {
+			return "", err
 		}
-		renameAttachmentsMatchingPrefix(it.oldNo, newNo)
+		if node.id == focusID {
+			finalFocusSerial = newNo
+		}
+		if node.oldNo != "" && !strings.HasPrefix(node.oldNo, "INIT-TMP-") && node.oldNo != newNo {
+			renames = append(renames, renamePair{oldPrefix: node.oldNo, newPrefix: newNo})
+		}
 	}
-	return nil
+
+	for _, rp := range renames {
+		renameAttachmentsMatchingPrefix(rp.oldPrefix, rp.newPrefix)
+	}
+	return finalFocusSerial, nil
 }
 
-// 同步重命名附件目录中以旧编号开头的文件（保证顺延或修改编号后附件资料编号严丝合缝）
+// 同步重命名附件目录中以旧编号开头的文件（先转临时名避免链式覆盖冲突）
 func renameAttachmentsMatchingPrefix(oldPrefix, newPrefix string) {
 	if oldPrefix == "" || newPrefix == "" || oldPrefix == newPrefix {
 		return
@@ -509,7 +553,7 @@ func reconcileItemPackQuantities(itemID int64) {
 	}
 }
 
-// 移动加权平均成本全周期重算引擎（按流水编号顺序推进）：精确计算每笔出库成本与出库单价
+// 移动加权平均成本全周期重算引擎（按流水编号顺序推进）：精确计算每笔流水前后库存、出库成本与出库单价
 type movingAvgSnapshot struct {
 	StockQty        int64
 	StockValue      float64
@@ -522,14 +566,17 @@ type movingAvgSnapshot struct {
 	OpeningValue    float64
 }
 
-type outCostDetail struct {
+type txReplayDetail struct {
+	BeforeQty    int64
+	AfterQty     int64
 	OutAmount    float64
 	OutUnitPrice float64
+	HasNegative  bool
 }
 
-func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingAvgSnapshot, map[int64]outCostDetail) {
+func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingAvgSnapshot, map[int64]txReplayDetail) {
 	var snap movingAvgSnapshot
-	txOutMap := make(map[int64]outCostDetail)
+	txMap := make(map[int64]txReplayDetail)
 
 	rows, err := db.Query(`
 		SELECT id, tx_type, tx_date, base_qty, total_amount
@@ -537,7 +584,7 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 		WHERE item_id = ?
 		ORDER BY ledger_year ASC, seq_num ASC, id ASC`, itemID)
 	if err != nil {
-		return snap, txOutMap
+		return snap, txMap
 	}
 	defer rows.Close()
 
@@ -559,28 +606,34 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 			openingCaptured = true
 		}
 
-		if endDate != "" && tDate > endDate {
-			continue
-		}
-
 		inPeriod := (startDate == "" || tDate >= startDate) && (endDate == "" || tDate <= endDate)
+		beforeQty := curQty
 
 		if tType == "IN" {
 			curQty += qty
 			curVal = round2(curVal + amt)
+			txMap[id] = txReplayDetail{
+				BeforeQty: beforeQty,
+				AfterQty:  curQty,
+			}
 			if inPeriod {
 				snap.PeriodInQty += qty
 				snap.PeriodInValue = round2(snap.PeriodInValue + amt)
 			}
 		} else if tType == "OUT" {
 			var outCost, outUnit float64
+			hasNeg := false
+			if qty > curQty {
+				hasNeg = true
+			}
 			if curQty <= 0 {
 				outCost = 0
 				outUnit = 0
+				curQty -= qty
 			} else if qty >= curQty {
 				outCost = round2(curVal)
 				outUnit = round4(curVal / float64(curQty))
-				curQty = 0
+				curQty -= qty
 				curVal = 0
 			} else {
 				avgPrice := curVal / float64(curQty)
@@ -592,7 +645,13 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 					curVal = 0
 				}
 			}
-			txOutMap[id] = outCostDetail{OutAmount: outCost, OutUnitPrice: outUnit}
+			txMap[id] = txReplayDetail{
+				BeforeQty:    beforeQty,
+				AfterQty:     curQty,
+				OutAmount:    outCost,
+				OutUnitPrice: outUnit,
+				HasNegative:  hasNeg,
+			}
 			if inPeriod {
 				snap.PeriodOutQty += qty
 				snap.PeriodOutValue = round2(snap.PeriodOutValue + outCost)
@@ -609,7 +668,7 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 	if curQty > 0 {
 		snap.MovingUnitPrice = round4(curVal / float64(curQty))
 	}
-	return snap, txOutMap
+	return snap, txMap
 }
 
 func isLocalRequest(r *http.Request) bool {
@@ -791,6 +850,7 @@ func handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"success": false})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Passcode string `json:"passcode"`
 	}
@@ -828,6 +888,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]interface{}{"success": false, "message": "仅管理员可修改系统设置"})
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Port          int    `json:"port"`
 		AdminPasscode string `json:"admin_passcode"`
@@ -965,6 +1026,7 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req struct {
 			Category string `json:"category"`
 			Name     string `json:"name"`
@@ -1031,6 +1093,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Category      string `json:"category"`
 		Name          string `json:"name"`
@@ -1093,18 +1156,7 @@ func natureLabel(n string) string {
 	return "消耗品"
 }
 
-// ==================== 7. 消耗品入库与领用流水账（编号排序 + 插入顺延 + 日期倒挂警告 + 领用单价计算） ====================
-
-func generateNextConsumableSerial(tx *sql.Tx, year int) (int, string, error) {
-	var maxSeq sql.NullInt64
-	err := tx.QueryRow(`SELECT MAX(seq_num) FROM consumable_ledger WHERE ledger_year = ?`, year).Scan(&maxSeq)
-	if err != nil {
-		return 0, "", err
-	}
-	nextSeq := int(maxSeq.Int64) + 1
-	serialNo := fmt.Sprintf("XH-%d-%06d", year, nextSeq)
-	return nextSeq, serialNo, nil
-}
+// ==================== 7. 消耗品入库与领用流水账（连续重排 + 日期倒挂标晚日期条目 + 结存前后数量） ====================
 
 func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -1116,7 +1168,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		endDate := r.URL.Query().Get("end_date")
 		yearStr := r.URL.Query().Get("year")
 
-		// 严格按流水编号顺序排序（ledger_year ASC, seq_num ASC）
+		// 先按全量流水编号顺序查出，确保日期倒挂检测与移动加权结存前后数量基于全局真实序列计算
 		q := `
 		SELECT cl.id, cl.ledger_year, cl.seq_num, cl.serial_no, cl.item_id,
 		       i.category, i.name, i.base_unit, i.pack_unit, i.pack_size,
@@ -1124,35 +1176,9 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		       cl.recipient, cl.remark, cl.created_at
 		FROM consumable_ledger cl
 		JOIN items i ON cl.item_id = i.id
-		WHERE 1=1`
-		var args []interface{}
-		if category != "" {
-			q += ` AND i.category = ?`
-			args = append(args, category)
-		}
-		if itemID != "" {
-			q += ` AND cl.item_id = ?`
-			args = append(args, itemID)
-		}
-		if txType != "" {
-			q += ` AND cl.tx_type = ?`
-			args = append(args, txType)
-		}
-		if yearStr != "" {
-			q += ` AND cl.ledger_year = ?`
-			args = append(args, yearStr)
-		}
-		if startDate != "" {
-			q += ` AND cl.tx_date >= ?`
-			args = append(args, startDate)
-		}
-		if endDate != "" {
-			q += ` AND cl.tx_date <= ?`
-			args = append(args, endDate)
-		}
-		q += ` ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`
+		ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`
 
-		rows, err := db.Query(q, args...)
+		rows, err := db.Query(q)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
@@ -1179,36 +1205,65 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		}
 		rows.Close()
 
-		allOutDetail := make(map[int64]outCostDetail)
+		allTxDetail := make(map[int64]txReplayDetail)
 		for itID := range distinctItems {
-			_, costMap := replayConsumableMovingAvg(itID, "", "")
-			for k, v := range costMap {
-				allOutDetail[k] = v
+			_, txMap := replayConsumableMovingAvg(itID, "", "")
+			for k, v := range txMap {
+				allTxDetail[k] = v
+			}
+		}
+
+		// 计算同年度每条流水之后的最小日期：若当前条目的日期晚于同年度后续条目的日期（如22日插在21日前面），则标记当前22日这一条！
+		anomalyMsgMap := make(map[int64]string)
+		minFutureDateByYear := make(map[int64]string)
+		minFutureSerialByYear := make(map[int64]string)
+
+		for i := len(rawList) - 1; i >= 0; i-- {
+			cur := rawList[i]
+			if minD, ok := minFutureDateByYear[cur.lYear]; ok {
+				if cur.tDate > minD {
+					anomalyMsgMap[cur.id] = fmt.Sprintf("日期 (%s) 晚于后续编号 %s (%s)，疑似日期倒挂", cur.tDate, minFutureSerialByYear[cur.lYear], minD)
+				}
+				if cur.tDate <= minD {
+					minFutureDateByYear[cur.lYear] = cur.tDate
+					minFutureSerialByYear[cur.lYear] = cur.serialNo
+				}
+			} else {
+				minFutureDateByYear[cur.lYear] = cur.tDate
+				minFutureSerialByYear[cur.lYear] = cur.serialNo
 			}
 		}
 
 		list := make([]map[string]interface{}, 0, len(rawList))
-		prevDateByYear := make(map[int64]string)
-		prevSerialByYear := make(map[int64]string)
-
 		for _, rItem := range rawList {
+			if category != "" && rItem.cat != category {
+				continue
+			}
+			if itemID != "" && strconv.FormatInt(rItem.itID, 10) != itemID {
+				continue
+			}
+			if txType != "" && rItem.tType != txType {
+				continue
+			}
+			if yearStr != "" && strconv.FormatInt(rItem.lYear, 10) != yearStr {
+				continue
+			}
+			if startDate != "" && rItem.tDate < startDate {
+				continue
+			}
+			if endDate != "" && rItem.tDate > endDate {
+				continue
+			}
+
+			det := allTxDetail[rItem.id]
 			outCost := 0.0
 			effUnitPrice := rItem.uPrice
 			if rItem.tType == "OUT" {
-				det := allOutDetail[rItem.id]
 				outCost = det.OutAmount
 				effUnitPrice = det.OutUnitPrice
 			}
 
-			// 检测相邻编号日期错乱（如 000001 是 2026-11-21，000002 却是 2026-11-20）
-			dateAnomaly := false
-			anomalyMsg := ""
-			if prevD, ok := prevDateByYear[rItem.lYear]; ok && rItem.tDate < prevD {
-				dateAnomaly = true
-				anomalyMsg = fmt.Sprintf("日期早于上一编号 %s (%s)", prevSerialByYear[rItem.lYear], prevD)
-			}
-			prevDateByYear[rItem.lYear] = rItem.tDate
-			prevSerialByYear[rItem.lYear] = rItem.serialNo
+			aMsg, hasAnomaly := anomalyMsgMap[rItem.id]
 
 			spec := fmt.Sprintf("1%s=%d%s", rItem.pUnit, rItem.pSize, rItem.bUnit)
 			if rItem.pUnit == "" {
@@ -1229,21 +1284,24 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 				"pack_spec":    spec,
 				"tx_type":      rItem.tType,
 				"tx_date":      rItem.tDate,
+				"before_qty":   det.BeforeQty,
 				"base_qty":     rItem.bQty,
+				"after_qty":    det.AfterQty,
 				"pack_qty":     rItem.pQty,
 				"total_amount": rItem.totAmt,
 				"out_amount":   outCost,
 				"unit_price":   round2(effUnitPrice),
 				"recipient":    rItem.recip,
 				"remark":       rItem.rmk,
-				"date_anomaly": dateAnomaly,
-				"anomaly_msg":  anomalyMsg,
+				"date_anomaly": hasAnomaly,
+				"anomaly_msg":  aMsg,
 				"created_at":   rItem.createdAt,
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req struct {
 			ItemID         int64   `json:"item_id"`
 			TxType         string  `json:"tx_type"`
@@ -1310,7 +1368,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(req.CustomSerialNo) != "" {
 			isBackdate = true
 			if backdateReason == "" {
-				backdateReason = "手动指定插入流水编号并顺延后续序号"
+				backdateReason = "手动指定插入流水编号并重排连续序号"
 			}
 		}
 
@@ -1319,7 +1377,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusConflict, map[string]interface{}{
 					"success":       false,
 					"need_override": true,
-					"message":       fmt.Sprintf("时序/编号校验提示：%s！请输入管理员最高权限口令授权（可同时指定插入的流水编号，后续序号将自动顺延）。", backdateReason),
+					"message":       fmt.Sprintf("时序/编号校验提示：%s！请输入管理员最高权限口令授权（可同时指定插入的流水编号，后续序号将自动连续重排）。", backdateReason),
 				})
 				return
 			}
@@ -1332,19 +1390,21 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if req.TxType == "OUT" {
-			if strings.TrimSpace(req.Recipient) == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "领用登记必须填写领用人"})
+		if req.TxType == "OUT" && strings.TrimSpace(req.Recipient) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "领用登记必须填写领用人"})
+			return
+		}
+
+		desiredSeq := 999999999
+		customNo := strings.TrimSpace(req.CustomSerialNo)
+		if customNo != "" {
+			cYear, cSeq, ok := parseConsumableSerialNo(customNo)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "自定义流水编号格式错误，正确格式如：XH-2026-000002"})
 				return
 			}
-			snapAll, _ := replayConsumableMovingAvg(req.ItemID, "", "")
-			if intBaseQty > snapAll.StockQty {
-				writeJSON(w, http.StatusBadRequest, map[string]interface{}{
-					"success": false,
-					"message": fmt.Sprintf("库存不足！当前最新可用结存仅为 %d，无法领用 %d", snapAll.StockQty, intBaseQty),
-				})
-				return
-			}
+			yearPart = cYear
+			desiredSeq = cSeq
 		}
 
 		initPackQty := calcPackDisplay(intBaseQty, packSize)
@@ -1360,43 +1420,49 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		}
 		defer tx.Rollback()
 
-		var seqNum int
-		var serialNo string
-		customNo := strings.TrimSpace(req.CustomSerialNo)
-		if customNo != "" {
-			cYear, cSeq, ok := parseConsumableSerialNo(customNo)
-			if !ok {
-				writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "自定义流水编号格式错误，正确格式如：XH-2026-000002"})
-				return
-			}
-			yearPart = cYear
-			seqNum = cSeq
-			serialNo = fmt.Sprintf("XH-%d-%06d", yearPart, seqNum)
-			if err := shiftConsumableSerialsFrom(tx, yearPart, seqNum, 0); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
-				return
-			}
-		} else {
-			seqNum, serialNo, err = generateNextConsumableSerial(tx, yearPart)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
-				return
-			}
-		}
-
 		now := nowStr()
+		tmpSerial := fmt.Sprintf("INIT-TMP-%d", time.Now().UnixNano())
 		res, err := tx.Exec(`
 			INSERT INTO consumable_ledger (ledger_year, seq_num, serial_no, item_id, tx_type, tx_date, base_qty, pack_qty, total_amount, unit_price, recipient, remark, created_at, updated_at)
 			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			yearPart, seqNum, serialNo, req.ItemID, req.TxType, req.TxDate, intBaseQty, initPackQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), now, now)
+			yearPart, desiredSeq, tmpSerial, req.ItemID, req.TxType, req.TxDate, intBaseQty, initPackQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), now, now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
 		newID, _ := res.LastInsertId()
 
+		finalSerialNo, err := resequenceConsumableYear(tx, yearPart, newID, desiredSeq)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
 		if err := tx.Commit(); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
+		// 校验全周期（含中间插号时点）是否出现负库存，若出现负库存则回滚删除刚插入的记录
+		snapAll, txMap := replayConsumableMovingAvg(req.ItemID, "", "")
+		hasNeg := snapAll.StockQty < 0
+		for _, d := range txMap {
+			if d.HasNegative {
+				hasNeg = true
+				break
+			}
+		}
+		if hasNeg {
+			txClean, _ := db.Begin()
+			if txClean != nil {
+				_, _ = txClean.Exec(`DELETE FROM consumable_ledger WHERE id = ?`, newID)
+				_, _ = resequenceConsumableYear(txClean, yearPart, 0, 0)
+				_ = txClean.Commit()
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("库存不足！在当前编号时点或后续流转中可用库存不足以支取 %d（当前最新结存 %d）。", intBaseQty, snapAll.StockQty+intBaseQty),
+			})
 			return
 		}
 
@@ -1406,7 +1472,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		_ = db.QueryRow(`SELECT pack_qty FROM consumable_ledger WHERE id = ?`, newID).Scan(&finalPackQty)
 
 		if isBackdate {
-			writeAudit("特权补录/插号登记流水", serialNo, fmt.Sprintf("单据日期:%s, 数量:%d, 原因:%s", req.TxDate, intBaseQty, backdateReason))
+			writeAudit("特权补录/插号登记流水", finalSerialNo, fmt.Sprintf("单据日期:%s, 数量:%d, 原因:%s", req.TxDate, intBaseQty, backdateReason))
 		}
 
 		if req.TxType == "IN" {
@@ -1418,7 +1484,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":             true,
 			"id":                  newID,
-			"serial_no":           serialNo,
+			"serial_no":           finalSerialNo,
 			"reconciled_pack_qty": finalPackQty,
 		})
 
@@ -1440,6 +1506,7 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		SerialNo      string  `json:"serial_no"`
 		TxDate        string  `json:"tx_date"`
@@ -1481,23 +1548,8 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		packSize = 1
 	}
 
-	snapAll, _ := replayConsumableMovingAvg(itemID, "", "")
-	var simulatedStock int64
-	if txType == "IN" {
-		simulatedStock = snapAll.StockQty - oldQty + intBaseQty
-	} else {
-		simulatedStock = snapAll.StockQty + oldQty - intBaseQty
-	}
-	if simulatedStock < 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "修改冲突：按此数量修改后会导致当前总库存变为负数！"})
-		return
-	}
-
 	targetYear := oldYear
 	targetSeq := oldSeq
-	targetSerialNo := oldSerialNo
-	serialChanged := false
-
 	newSerialInput := strings.TrimSpace(req.SerialNo)
 	if newSerialInput != "" && strings.ToUpper(newSerialInput) != oldSerialNo {
 		pYear, pSeq, ok := parseConsumableSerialNo(newSerialInput)
@@ -1507,8 +1559,6 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		}
 		targetYear = pYear
 		targetSeq = pSeq
-		targetSerialNo = fmt.Sprintf("XH-%d-%06d", targetYear, targetSeq)
-		serialChanged = true
 	}
 
 	packQty := calcPackDisplay(intBaseQty, packSize)
@@ -1524,17 +1574,21 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	if serialChanged {
-		// 先将当前记录暂存临时编号，避免占坑冲突
-		_, _ = tx.Exec(`UPDATE consumable_ledger SET serial_no = ? WHERE id = ?`, fmt.Sprintf("EDIT-TMP-%d", ledgerID), ledgerID)
-		if err := shiftConsumableSerialsFrom(tx, targetYear, targetSeq, ledgerID); err != nil {
+	_, err = tx.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, pack_qty = ?, total_amount = ?, unit_price = ?, recipient = ?, remark = ?, updated_at = ? WHERE id = ?`,
+		targetYear, req.TxDate, intBaseQty, packQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), nowStr(), ledgerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
+		return
+	}
+
+	// 若跨年份修改，先闭合原年份连续序号，再重排目标年份连续序号
+	if targetYear != oldYear {
+		if _, err := resequenceConsumableYear(tx, oldYear, 0, 0); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
 	}
-
-	_, err = tx.Exec(`UPDATE consumable_ledger SET ledger_year = ?, seq_num = ?, serial_no = ?, tx_date = ?, base_qty = ?, pack_qty = ?, total_amount = ?, unit_price = ?, recipient = ?, remark = ?, updated_at = ? WHERE id = ?`,
-		targetYear, targetSeq, targetSerialNo, req.TxDate, intBaseQty, packQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), nowStr(), ledgerID)
+	finalSerialNo, err := resequenceConsumableYear(tx, targetYear, ledgerID, targetSeq)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
@@ -1545,8 +1599,32 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if serialChanged {
-		renameAttachmentsMatchingPrefix(oldSerialNo, targetSerialNo)
+	// 校验修正并重排序号后全周期是否出现负库存，若冲突则自动恢复原状
+	snapAll, txMap := replayConsumableMovingAvg(itemID, "", "")
+	hasNeg := snapAll.StockQty < 0
+	for _, d := range txMap {
+		if d.HasNegative {
+			hasNeg = true
+			break
+		}
+	}
+	if hasNeg {
+		txRevert, _ := db.Begin()
+		if txRevert != nil {
+			oldUnit := 0.0
+			if txType == "IN" && oldAmt > 0 && oldQty > 0 {
+				oldUnit = round4(oldAmt / float64(oldQty))
+			}
+			_, _ = txRevert.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, total_amount = ?, unit_price = ?, recipient = ? WHERE id = ?`,
+				oldYear, oldDate, oldQty, oldAmt, oldUnit, oldRecip, ledgerID)
+			if targetYear != oldYear {
+				_, _ = resequenceConsumableYear(txRevert, targetYear, 0, 0)
+			}
+			_, _ = resequenceConsumableYear(txRevert, oldYear, ledgerID, oldSeq)
+			_ = txRevert.Commit()
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "修改冲突：按此数量或编号调整后会导致某时点库存变为负数，已自动撤销本次修改！"})
+		return
 	}
 
 	reconcileItemPackQuantities(itemID)
@@ -1557,8 +1635,8 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		recordRecipient(req.Recipient)
 	}
 
-	writeAudit("修正消耗品流水记录", targetSerialNo, fmt.Sprintf("原[编号:%s, 日期:%s, 数量:%d, 金额:%g] -> 新[编号:%s, 日期:%s, 数量:%d, 金额:%g]", oldSerialNo, oldDate, oldQty, oldAmt, targetSerialNo, req.TxDate, intBaseQty, req.TotalAmount))
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "serial_no": targetSerialNo, "message": "流水记录已修正，相关序号与附件已同步顺延"})
+	writeAudit("修正消耗品流水记录", finalSerialNo, fmt.Sprintf("原[编号:%s, 日期:%s, 数量:%d, 金额:%g] -> 新[编号:%s, 日期:%s, 数量:%d, 金额:%g]", oldSerialNo, oldDate, oldQty, oldAmt, finalSerialNo, req.TxDate, intBaseQty, req.TotalAmount))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "serial_no": finalSerialNo, "message": "流水记录已修正，全年度序号已连续重排并闭合"})
 }
 
 // ==================== 8. 会计级期初/期末盘点（含本期入库包装数、移动加权在库价值与纯数字输出） ====================
@@ -1904,6 +1982,7 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		CarryYear     int    `json:"carry_year"`
 		AdminPasscode string `json:"admin_passcode"`
@@ -2144,6 +2223,11 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "表单解析失败"})
 			return
 		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
 		itemID, _ := strconv.ParseInt(r.FormValue("item_id"), 10, 64)
 		qty, _ := strconv.Atoi(r.FormValue("quantity"))
 		if qty <= 0 {
@@ -2278,6 +2362,11 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 2 && parts[1] == "transition" && r.Method == http.MethodPost {
 		_ = r.ParseMultipartForm(20 << 20)
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
 		action := r.FormValue("action")
 		actionDate := strings.TrimSpace(r.FormValue("action_date"))
 		if actionDate == "" {
@@ -2483,6 +2572,11 @@ func handleMonthlyAttachments(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "上传解析失败"})
 			return
 		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
 		ym := strings.TrimSpace(r.FormValue("year_month"))
 		if ym == "" {
 			ym = time.Now().Format("2006-01")
@@ -2531,6 +2625,7 @@ func handleMonthlyAttachmentByID(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPut:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var req struct {
 			YearMonth     string `json:"year_month"`
 			Title         string `json:"title"`
@@ -2604,7 +2699,7 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 }
 
-// ==================== 11. Excel 专业导出（右上角标注金额单位：元 + 纯数字单元格 + 单项资产履历导出） ====================
+// ==================== 11. Excel 专业导出（右上角标注金额单位：元 + 居中/金额右对齐 + 前后结存数量） ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
@@ -2651,9 +2746,19 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			{Type: "bottom", Color: "94A3B8", Style: 2},
 		},
 	})
-	cellStyle, _ := f.NewStyle(&excelize.Style{
+	centerCellStyle, _ := f.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Size: 10, Family: "Microsoft YaHei"},
-		Alignment: &excelize.Alignment{Vertical: "center", WrapText: true},
+		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center", WrapText: true},
+		Border: []excelize.Border{
+			{Type: "left", Color: "CBD5E1", Style: 1},
+			{Type: "right", Color: "CBD5E1", Style: 1},
+			{Type: "top", Color: "CBD5E1", Style: 1},
+			{Type: "bottom", Color: "CBD5E1", Style: 1},
+		},
+	})
+	moneyCellStyle, _ := f.NewStyle(&excelize.Style{
+		Font:      &excelize.Font{Size: 10, Family: "Microsoft YaHei"},
+		Alignment: &excelize.Alignment{Horizontal: "right", Vertical: "center", WrapText: true},
 		Border: []excelize.Border{
 			{Type: "left", Color: "CBD5E1", Style: 1},
 			{Type: "right", Color: "CBD5E1", Style: 1},
@@ -2686,6 +2791,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, rightStartCol+"2", endCol+"2", metaRightStyle)
 		}
 		_ = f.SetRowHeight(sheet, 2, 20)
+		_ = f.SetRowHeight(sheet, 3, 28)
 
 		orient := "landscape"
 		fitToWidth := 1
@@ -2707,7 +2813,8 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "办公消耗品入库与领用接续流水账"
 		}
-		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "基本数量", "倒挤包装数", "采购/出库金额", "单价", "领用人", "备注"}
+		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "基本数量", "入库/领用后数量", "倒挤包装数", "采购/领用金额", "单价", "领用人", "备注"}
+		moneyCols := map[int]bool{12: true, 13: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -2737,11 +2844,11 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			}
 			rows.Close()
 		}
-		outDetails := make(map[int64]outCostDetail)
+		allDetails := make(map[int64]txReplayDetail)
 		for itID := range itemsSet {
 			_, m := replayConsumableMovingAvg(itID, "", "")
 			for k, v := range m {
-				outDetails[k] = v
+				allDetails[k] = v
 			}
 		}
 
@@ -2750,9 +2857,9 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			typeZh := "入库"
 			amtShow := round2(e.tAmt)
 			unitShow := round2(e.uPrice)
+			det := allDetails[e.id]
 			if e.tType == "OUT" {
 				typeZh = "领用"
-				det := outDetails[e.id]
 				amtShow = det.OutAmount
 				unitShow = round2(det.OutUnitPrice)
 			}
@@ -2760,11 +2867,15 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			if e.pUnit == "" {
 				spec = fmt.Sprintf("1%s", e.bUnit)
 			}
-			vals := []interface{}{e.sNo, e.tDate, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, e.bQty, e.pQty, amtShow, unitShow, e.recip, e.rmk}
+			vals := []interface{}{e.sNo, e.tDate, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, det.BeforeQty, e.bQty, det.AfterQty, e.pQty, amtShow, unitShow, e.recip, e.rmk}
 			for cIdx, v := range vals {
 				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 				_ = f.SetCellValue(sheet, cell, v)
-				_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+				st := centerCellStyle
+				if moneyCols[cIdx] {
+					st = moneyCellStyle
+				}
+				_ = f.SetCellStyle(sheet, cell, cell, st)
 			}
 			rIdx++
 		}
@@ -2777,6 +2888,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			customTitle = "企业复用品（类资产）独立编码盘点台账"
 		}
 		headers := []string{"资产编号", "用品分类", "标准品名", "二级品名/位置", "购置日期", "购置单价", "预计年限(年)", "预计处置日期", "当前状态", "当前使用人", "报废日期", "备注"}
+		moneyCols := map[int]bool{5: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出日期：%s", customOrg, todayStr()), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -2798,7 +2910,11 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 				for cIdx, v := range vals {
 					cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 					_ = f.SetCellValue(sheet, cell, v)
-					_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+					stCell := centerCellStyle
+					if moneyCols[cIdx] {
+						stCell = moneyCellStyle
+					}
+					_ = f.SetCellStyle(sheet, cell, cell, stCell)
 				}
 				rIdx++
 			}
@@ -2840,7 +2956,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 				for cIdx, v := range vals {
 					cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 					_ = f.SetCellValue(sheet, cell, v)
-					_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+					_ = f.SetCellStyle(sheet, cell, cell, centerCellStyle)
 				}
 				rIdx++
 			}
@@ -2861,6 +2977,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			"期末结存(基本数量)", "期末结存(包装数量)",
 			"平均价", "当前在库价值", "采购价格分布",
 		}
+		moneyCols := map[int]bool{13: true, 14: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -2898,7 +3015,11 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			for cIdx, v := range vals {
 				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 				_ = f.SetCellValue(sheet, cell, v)
-				_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+				stCell := centerCellStyle
+				if moneyCols[cIdx] {
+					stCell = moneyCellStyle
+				}
+				_ = f.SetCellStyle(sheet, cell, cell, stCell)
 			}
 			rIdx++
 		}
@@ -2973,7 +3094,11 @@ func startHTTPServer(port int) error {
 	currentPort = actualPort
 
 	srv := &http.Server{
-		Handler: buildHTTPMux(),
+		Handler:           buildHTTPMux(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	httpSrv = srv
 
