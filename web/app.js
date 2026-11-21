@@ -259,7 +259,7 @@ async function submitEditItem() {
   await loadConsumableData();
 }
 
-// ==================== 2. 消耗品出入库（包装数量可辅助填写 + 基本数量强制正整数 + 插入编号顺延） ====================
+// ==================== 2. 消耗品出入库 ====================
 
 async function loadRecipients() {
   const resp = await apiFetch('/api/recipients');
@@ -319,7 +319,6 @@ function onTxItemChange() {
   onBaseQtyInput();
 }
 
-// 填写基本数量 -> 自动换算参考包装数（保留2位小数，不反改基本数量）
 function onBaseQtyInput() {
   const id = parseInt(document.getElementById('tx-item-id').value, 10);
   const it = allItems.find(x => x.id === id);
@@ -345,7 +344,6 @@ function onBaseQtyInput() {
   calcTxUnitPrice();
 }
 
-// 填写包装数量 -> 辅助换算并四舍五入为基本数量正整数（包装服务于基本数量）
 function onPackQtyInput() {
   const id = parseInt(document.getElementById('tx-item-id').value, 10);
   const it = allItems.find(x => x.id === id);
@@ -465,15 +463,15 @@ async function loadConsumableData() {
         <td>${it.base_unit}</td>
         <td>${it.pack_unit || '-'}</td>
         <td>${it.pack_spec}</td>
-        <td><strong>${it.opening_base_qty}</strong></td>
-        <td>${it.opening_pack_qty}</td>
-        <td style="color:#059669;">${it.in_base_qty}</td>
-        <td style="color:#059669;">${it.in_pack_qty}</td>
-        <td style="color:#dc2626;">${it.out_base_qty}</td>
-        <td style="background:#eff6ff;"><strong>${it.closing_base_qty}</strong></td>
-        <td style="background:#eff6ff;">${it.closing_pack_qty}</td>
-        <td>${(it.moving_avg_price || 0).toFixed(2)}</td>
-        <td style="background:#f0fdf4;color:#166534;"><strong>${(it.closing_value || 0).toFixed(2)}</strong></td>
+        <td class="col-qty"><strong>${it.opening_base_qty}</strong></td>
+        <td class="col-qty">${it.opening_pack_qty}</td>
+        <td class="col-qty" style="color:#059669;">${it.in_base_qty}</td>
+        <td class="col-qty" style="color:#059669;">${it.in_pack_qty}</td>
+        <td class="col-qty" style="color:#dc2626;">${it.out_base_qty}</td>
+        <td class="col-qty" style="background:#eff6ff;"><strong>${it.closing_base_qty}</strong></td>
+        <td class="col-qty" style="background:#eff6ff;">${it.closing_pack_qty}</td>
+        <td class="col-money">${(it.moving_avg_price || 0).toFixed(2)}</td>
+        <td class="col-money" style="background:#f0fdf4;color:#166534;"><strong>${(it.closing_value || 0).toFixed(2)}</strong></td>
         <td>${priceBtn}</td>
       </tr>`;
   }).join('');
@@ -518,10 +516,12 @@ async function loadConsumableLedger() {
         <td>${r.pack_unit || '-'}</td>
         <td>${r.pack_spec}</td>
         <td><span class="badge ${isIn ? 'badge-in' : 'badge-out'}">${isIn ? '入库' : '领用'}</span></td>
-        <td><strong>${r.base_qty}</strong></td>
-        <td>${r.pack_qty}</td>
-        <td>${amtText}</td>
-        <td>${priceText}</td>
+        <td class="col-qty">${r.before_qty}</td>
+        <td class="col-qty"><strong>${r.base_qty}</strong></td>
+        <td class="col-qty"><strong>${r.after_qty}</strong></td>
+        <td class="col-qty">${r.pack_qty}</td>
+        <td class="col-money">${amtText}</td>
+        <td class="col-money">${priceText}</td>
         <td>${r.recipient || '-'}</td>
         <td>${r.remark || '-'}</td>
         <td class="no-print">${editBtn}</td>
@@ -659,9 +659,9 @@ async function openPriceDistModal(itemID) {
     <div class="hist-chart">${barsHtml}</div>
     <div class="table-responsive" style="max-height:200px;">
       <table class="data-table">
-        <thead><tr><th>采购日期</th><th>入库数量 (${res.base_unit})</th><th>采购总金额</th><th>折算单价</th></tr></thead>
+        <thead><tr><th>采购日期</th><th class="col-qty">入库数量 (${res.base_unit})</th><th class="col-money">采购总金额</th><th class="col-money">折算单价</th></tr></thead>
         <tbody>
-          ${res.records.map(rec => `<tr><td>${rec.date}</td><td>${rec.qty}</td><td>${rec.total_amount.toFixed(2)}</td><td><strong>${rec.unit_price.toFixed(2)}</strong></td></tr>`).join('')}
+          ${res.records.map(rec => `<tr><td>${rec.date}</td><td class="col-qty">${rec.qty}</td><td class="col-money">${rec.total_amount.toFixed(2)}</td><td class="col-money"><strong>${rec.unit_price.toFixed(2)}</strong></td></tr>`).join('')}
         </tbody>
       </table>
     </div>
@@ -766,8 +766,8 @@ async function loadReusableAssets() {
         <td>${a.sub_name || '-'}</td>
         <td class="no-print">${imgHtml}</td>
         <td>${a.purchase_date}</td>
-        <td>${a.unit_price.toFixed(2)}</td>
-        <td>${a.expected_years}</td>
+        <td class="col-money">${a.unit_price.toFixed(2)}</td>
+        <td class="col-qty">${a.expected_years}</td>
         <td>${a.disposal_date}</td>
         <td><span class="badge ${badgeCls}">${a.status}</span></td>
         <td><strong>${a.current_user || '-'}</strong></td>
@@ -1063,7 +1063,7 @@ async function loadAuditLogs() {
   `).join('');
 }
 
-// ==================== 8. 自定义打印（右上角金额单位：元 + 所有列缩放到一页 + 资产履历打印） ====================
+// ==================== 8. 自定义打印（右上角金额单位：元 + 所有列缩放到一页 + 居中/金额右对齐） ====================
 
 function openPrintPreview(mode) {
   currentPrintMode = mode;
@@ -1133,11 +1133,19 @@ function openPrintPreview(mode) {
     tbl.style.width = '100%';
     tbl.style.borderCollapse = 'collapse';
     tbl.style.fontSize = '11px';
-    tbl.querySelectorAll('th, td').forEach(cell => {
-      cell.style.border = '1px solid #334155';
-      cell.style.padding = '5px 6px';
-      cell.style.whiteSpace = 'normal';
-      cell.style.wordBreak = 'break-word';
+    tbl.querySelectorAll('th').forEach(th => {
+      th.style.border = '1px solid #334155';
+      th.style.padding = '5px 5px';
+      th.style.textAlign = 'center';
+      th.style.whiteSpace = 'normal';
+      th.style.wordBreak = 'break-word';
+    });
+    tbl.querySelectorAll('td').forEach(td => {
+      td.style.border = '1px solid #334155';
+      td.style.padding = '5px 5px';
+      td.style.whiteSpace = 'normal';
+      td.style.wordBreak = 'break-word';
+      td.style.textAlign = td.classList.contains('col-money') ? 'right' : 'center';
     });
   });
 
