@@ -119,7 +119,7 @@ function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
 }
 
-// ==================== 1. 用品库管理（含修改与权限删除） ====================
+// ==================== 1. 用品库管理（含专有编码、修改与权限删除） ====================
 
 function openDictModal() {
   renderDictTable();
@@ -146,7 +146,7 @@ function onInvCategoryChange() {
   const cat = document.getElementById('inv-category').value;
   const consumables = allItems.filter(i => i.nature === 'consumable' && (!cat || i.category === cat));
   document.getElementById('inv-item-id').innerHTML =
-    '<option value="">全部品名</option>' + consumables.map(i => `<option value="${i.id}">${i.name} (${i.base_unit})</option>`).join('');
+    '<option value="">全部品名</option>' + consumables.map(i => `<option value="${i.id}">[${i.item_code}] ${i.name} (${i.base_unit})</option>`).join('');
 }
 
 function renderDictTable() {
@@ -154,7 +154,7 @@ function renderDictTable() {
   const kw = document.getElementById('dict-kw').value.trim().toLowerCase();
   const filtered = allItems.filter(i => {
     if (nat && i.nature !== nat) return false;
-    if (kw && !i.name.toLowerCase().includes(kw) && !i.category.toLowerCase().includes(kw)) return false;
+    if (kw && !i.name.toLowerCase().includes(kw) && !i.category.toLowerCase().includes(kw) && !(i.item_code || '').toLowerCase().includes(kw)) return false;
     return true;
   });
 
@@ -172,10 +172,11 @@ function renderDictTable() {
       : priceTxt;
     const opsHtml = authState.role === 'admin'
       ? `<button class="btn btn-sm btn-outline" onclick="openEditItemModal(${it.id})">✏️ 修改</button> ` +
-        `<button class="btn btn-sm btn-danger" onclick="deleteDictItem(${it.id}, '${it.name.replace(/'/g, "\\'")}')">🗑️ 删除</button>`
+        `<button class="btn btn-sm btn-danger" onclick="deleteDictItem(${it.id}, '${it.item_code}', '${it.name.replace(/'/g, "\\'")}')">🗑️ 删除</button>`
       : `<span class="hint-text">只读</span>`;
     return `
       <tr>
+        <td><code>${it.item_code}</code></td>
         <td><strong>${it.category}</strong></td>
         <td>${it.name}</td>
         <td><span class="badge ${it.nature === 'consumable' ? 'badge-idle' : 'badge-use'}">${it.nature === 'consumable' ? '消耗品' : '复用品'}</span></td>
@@ -189,8 +190,8 @@ function renderDictTable() {
   }).join('');
 }
 
-async function deleteDictItem(id, name) {
-  const pass = prompt(`删除用品库条目【${name}】需要管理员最高权限确认，请输入管理员口令：`);
+async function deleteDictItem(id, itemCode, name) {
+  const pass = prompt(`删除用品库条目【${itemCode} ${name}】需要管理员最高权限确认，请输入管理员口令：`);
   if (!pass) return;
   const resp = await apiFetch(`/api/items/${id}?admin_passcode=${encodeURIComponent(pass)}`, {
     method: 'DELETE'
@@ -321,7 +322,7 @@ function openConsumableTxModal(type) {
 function filterTxItems() {
   const cat = document.getElementById('tx-cat-filter').value;
   const list = allItems.filter(i => i.nature === 'consumable' && (!cat || i.category === cat));
-  document.getElementById('tx-item-id').innerHTML = list.map(i => `<option value="${i.id}">${i.name} (${i.base_unit})</option>`).join('');
+  document.getElementById('tx-item-id').innerHTML = list.map(i => `<option value="${i.id}">[${i.item_code}] ${i.name} (${i.base_unit})</option>`).join('');
   onTxItemChange();
 }
 
@@ -331,7 +332,7 @@ function onTxItemChange() {
   if (!it) return;
   const spec = it.pack_unit ? `1 ${it.pack_unit} = ${it.pack_size} ${it.base_unit}` : `最小单位：${it.base_unit}`;
   document.getElementById('tx-item-spec-banner').innerHTML =
-    `规格：<strong>${spec}</strong> &nbsp;|&nbsp; 当前可用结存：<strong>${it.stock_qty} ${it.base_unit}</strong> &nbsp;|&nbsp; 在库价值：<strong>${(it.stock_value || 0).toFixed(2)} 元</strong>`;
+    `编码：<strong>${it.item_code}</strong> &nbsp;|&nbsp; 规格：<strong>${spec}</strong> &nbsp;|&nbsp; 当前可用结存：<strong>${it.stock_qty} ${it.base_unit}</strong> &nbsp;|&nbsp; 在库价值：<strong>${(it.stock_value || 0).toFixed(2)} 元</strong>`;
   document.getElementById('tx-base-label').textContent = `入库/领用数量 (${it.base_unit}，必须为整数) *`;
   document.getElementById('tx-pack-label').textContent = `参考包装数量 (${it.pack_unit || '件'}，填写可自动算基本数量)`;
   onBaseQtyInput();
@@ -479,6 +480,7 @@ async function loadConsumableData() {
     return `
       <tr data-closing-qty="${it.closing_base_qty}">
         <td>${it.seq}</td>
+        <td><code>${it.item_code || '-'}</code></td>
         <td>${it.category}</td>
         <td><strong>${it.item_name}</strong></td>
         <td>${it.base_unit}</td>
@@ -532,6 +534,7 @@ async function loadConsumableLedger() {
       <tr class="${r.date_anomaly ? 'row-anomaly' : ''}">
         <td><code>${r.serial_no}</code></td>
         <td>${r.tx_date}${dateWarnBadge}</td>
+        <td><code>${r.item_code || '-'}</code></td>
         <td>${r.category}</td>
         <td><strong>${r.item_name}</strong></td>
         <td>${r.base_unit}</td>
@@ -556,7 +559,7 @@ function openEditLedgerModal(id) {
   if (!row) return;
   document.getElementById('edit-ledger-id').value = row.id;
   document.getElementById('edit-ledger-packsize').value = row.pack_size || 1;
-  document.getElementById('edit-ledger-info').textContent = `正在修正流水：${row.serial_no} | ${row.item_name} (${row.tx_type === 'IN' ? '入库' : '领用'})`;
+  document.getElementById('edit-ledger-info').textContent = `正在修正流水：${row.serial_no} | [${row.item_code}] ${row.item_name} (${row.tx_type === 'IN' ? '入库' : '领用'})`;
   document.getElementById('edit-ledger-serial').value = row.serial_no;
   document.getElementById('edit-ledger-date').value = row.tx_date;
   document.getElementById('edit-ledger-qty').value = row.base_qty;
@@ -633,7 +636,7 @@ async function openPriceDistModal(itemID) {
     alert(res.message);
     return;
   }
-  document.getElementById('pd-title').textContent = `📊 【${res.item_name}】采购价格分布与合理区间分析（单位：元）`;
+  document.getElementById('pd-title').textContent = `📊 【${res.item_code || ''} ${res.item_name}】采购价格分布与合理区间分析（单位：元）`;
   const body = document.getElementById('pd-body');
 
   if (!res.has_data) {
@@ -695,7 +698,7 @@ async function openPriceDistModal(itemID) {
 
 function openReusableInModal() {
   const reusables = allItems.filter(i => i.nature === 'reusable');
-  document.getElementById('ra-in-item-id').innerHTML = reusables.map(i => `<option value="${i.id}">[${i.category}] ${i.name}</option>`).join('');
+  document.getElementById('ra-in-item-id').innerHTML = reusables.map(i => `<option value="${i.id}">[${i.item_code}] [${i.category}] ${i.name}</option>`).join('');
   document.getElementById('ra-in-subname').value = '';
   document.getElementById('ra-in-date').value = todayStr();
   document.getElementById('ra-in-qty').value = '1';
@@ -741,7 +744,7 @@ function openReusableEditModal(assetID) {
   document.getElementById('ra-edit-id').value = assetObj.id;
   document.getElementById('ra-edit-title').textContent = `✏️ 补录 / 修改类资产档案 (${assetObj.asset_no})`;
   document.getElementById('ra-edit-item-id').innerHTML = reusables.map(i =>
-    `<option value="${i.id}" ${i.id === assetObj.item_id ? 'selected' : ''}>[${i.category}] ${i.name}</option>`
+    `<option value="${i.id}" ${i.id === assetObj.item_id ? 'selected' : ''}>[${i.item_code}] [${i.category}] ${i.name}</option>`
   ).join('');
   document.getElementById('ra-edit-subname').value = assetObj.sub_name || '';
   document.getElementById('ra-edit-date').value = assetObj.purchase_date || todayStr();
@@ -838,6 +841,7 @@ async function loadReusableAssets() {
     return `
       <tr>
         <td><code>${a.asset_no}</code></td>
+        <td><code>${a.item_code || '-'}</code></td>
         <td>${a.category}</td>
         <td><strong>${a.item_name}</strong></td>
         <td>${a.sub_name || '-'}</td>
@@ -925,7 +929,7 @@ async function openAssetLogsModal(assetID) {
 
   document.getElementById('ra-logs-title').textContent = `📜 资产 ${currentInspectingAsset.asset_no} 全生命周期流转履历`;
   document.getElementById('ra-logs-meta').innerHTML = assetObj
-    ? `<strong>标准品名：</strong>${assetObj.item_name}（${assetObj.sub_name || '-'}） &nbsp;|&nbsp; <strong>购置日期：</strong>${assetObj.purchase_date} &nbsp;|&nbsp; <strong>购置单价：</strong>${assetObj.unit_price.toFixed(2)} 元 &nbsp;|&nbsp; <strong>预计年限：</strong>${assetObj.expected_years} 年 &nbsp;|&nbsp; <strong>预计处置日期：</strong>${assetObj.disposal_date} &nbsp;|&nbsp; <strong>当前状态：</strong>${assetObj.status}`
+    ? `<strong>标准品名：</strong>[${assetObj.item_code}] ${assetObj.item_name}（${assetObj.sub_name || '-'}） &nbsp;|&nbsp; <strong>购置日期：</strong>${assetObj.purchase_date} &nbsp;|&nbsp; <strong>购置单价：</strong>${assetObj.unit_price.toFixed(2)} 元 &nbsp;|&nbsp; <strong>预计年限：</strong>${assetObj.expected_years} 年 &nbsp;|&nbsp; <strong>预计处置日期：</strong>${assetObj.disposal_date} &nbsp;|&nbsp; <strong>当前状态：</strong>${assetObj.status}`
     : '';
 
   const resp = await apiFetch(`/api/reusables/assets/${assetID}/logs`);
