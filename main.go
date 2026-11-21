@@ -273,6 +273,7 @@ func initDatabase() error {
 	_, _ = db.Exec(`ALTER TABLE annual_carryover ADD COLUMN closing_value REAL NOT NULL DEFAULT 0`)
 
 	seedDefaultItems()
+	syncAllItemPriceRanges()
 	autoDailyBackup()
 	return nil
 }
@@ -307,13 +308,30 @@ func seedDefaultItems() {
 	}
 }
 
+func syncAllItemPriceRanges() {
+	rows, err := db.Query(`SELECT id FROM items`)
+	if err != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		recalculateItemPriceRange(id)
+	}
+}
+
 func autoDailyBackup() {
 	todayCompact := time.Now().Format("20060102")
 	dest := filepath.Join(backupDir, fmt.Sprintf("db_%s.sqlite", todayCompact))
 	if _, err := os.Stat(dest); err != nil {
 		_, _ = db.Exec(fmt.Sprintf(`VACUUM INTO '%s'`, strings.ReplaceAll(dest, "'", "''")))
 	}
-	// 清理超过 30 天的历史自动备份，防止长期占用磁盘空间
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		return
@@ -408,8 +426,6 @@ func parseConsumableSerialNo(serialNo string) (int, int, bool) {
 	return y, seq, true
 }
 
-// 全年度连续无断号重排引擎：
-// 将 focusID 插入到 year 年度的 desiredSeq 位置，自动闭合移动留下的空位并顺延后续序号，保证 1..N 绝对连续无断号
 func resequenceConsumableYear(tx *sql.Tx, year int, focusID int64, desiredSeq int) (string, error) {
 	rows, err := tx.Query(`
 		SELECT id, seq_num, serial_no
@@ -561,7 +577,6 @@ func reconcileItemPackQuantities(itemID int64) {
 	}
 }
 
-// 移动加权平均成本全周期重算引擎（严格保证 期初 + 本期入库 - 本期领用 = 截止日endDate的期末结存）
 type movingAvgSnapshot struct {
 	StockQty        int64
 	StockValue      float64
@@ -614,7 +629,6 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 			openingCaptured = true
 		}
 
-		// 若已超过统计截止日期 endDate，则不再计入本统计周期的期末结存，保持 期初 + 本期入 - 本期出 = 期末 严格成立
 		if endDate != "" && tDate > endDate {
 			continue
 		}
@@ -958,7 +972,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ==================== 6. 用品字典管理（防重复 + 修改数量守恒与实时倒挤重算） ====================
+// ==================== 6. 用品库管理（防重复 + 修改数量守恒折算 + 管理员安全删除） ====================
 
 type ItemDTO struct {
 	ID         int64   `json:"id"`
@@ -1101,6 +1115,40 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method == http.MethodDelete {
+		pass := r.URL.Query().Get("admin_passcode")
+		if !verifyAdminPasscode(pass) {
+			writeJSON(w, http.StatusForbidden, map[string]interface{}{"success": false, "message": "验证失败：删除用品库条目需要输入管理员口令！"})
+			return
+		}
+		var cat, name, nature string
+		err := db.QueryRow(`SELECT category, name, nature FROM items WHERE id = ?`, itemID).Scan(&cat, &name, &nature)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "未找到该用品信息"})
+			return
+		}
+
+		var ledgerCnt, assetCnt int
+		_ = db.QueryRow(`SELECT COUNT(1) FROM consumable_ledger WHERE item_id = ?`, itemID).Scan(&ledgerCnt)
+		_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE item_id = ?`, itemID).Scan(&assetCnt)
+		if ledgerCnt > 0 || assetCnt > 0 {
+			writeJSON(w, http.StatusConflict, map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("安全拦截：用品【%s】已有 %d 条消耗品流水及 %d 条类资产档案关联，为保障账目完整性禁止删除！", name, ledgerCnt, assetCnt),
+			})
+			return
+		}
+
+		_, _ = db.Exec(`DELETE FROM annual_carryover WHERE item_id = ?`, itemID)
+		if _, err := db.Exec(`DELETE FROM items WHERE id = ?`, itemID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		writeAudit("删除用品库条目", fmt.Sprintf("ID=%d (%s/%s)", itemID, cat, name), fmt.Sprintf("性质：%s，确认无历史流水/资产关联后删除", natureLabel(nature)))
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("已从用品库中删除【%s】", name)})
+		return
+	}
+
 	if r.Method != http.MethodPut {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"success": false})
 		return
@@ -1156,10 +1204,10 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 
 	reconcileItemPackQuantities(itemID)
 
-	writeAudit("修改基础用品字典", fmt.Sprintf("ID=%d (%s)", itemID, req.Name),
-		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算并倒挤历史包装数", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
+	writeAudit("修改用品库信息", fmt.Sprintf("ID=%d (%s)", itemID, req.Name),
+		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算折算包装数量", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品信息已修改，历史台账包装数量已按基本数量重新倒挤折算"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品库信息已修改，历史台账折算包装数量已按基本数量重新计算"})
 }
 
 func natureLabel(n string) string {
@@ -1169,7 +1217,7 @@ func natureLabel(n string) string {
 	return "消耗品"
 }
 
-// ==================== 7. 消耗品入库与领用流水账（连续重排 + 日期倒挂标晚日期条目 + 结存前后数量） ====================
+// ==================== 7. 消耗品入库与领用流水账 ====================
 
 func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -1332,7 +1380,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			req.TxDate = todayStr()
 		}
 		if req.BaseQty <= 0 || math.Abs(req.BaseQty-math.Round(req.BaseQty)) > 0.0001 {
-			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "基本数量必须为大于 0 的整数（最小计量单位不可取小数）"})
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "入库/领用数量必须为大于 0 的整数（最小计量单位不可取小数）"})
 			return
 		}
 		intBaseQty := int64(math.Round(req.BaseQty))
@@ -1535,7 +1583,7 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.BaseQty <= 0 || math.Abs(req.BaseQty-math.Round(req.BaseQty)) > 0.0001 {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "基本数量必须为正整数"})
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "入库/领用数量必须为正整数"})
 		return
 	}
 	intBaseQty := int64(math.Round(req.BaseQty))
@@ -1647,7 +1695,7 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "serial_no": finalSerialNo, "message": "流水记录已修正，全年度序号已连续重排并闭合"})
 }
 
-// ==================== 8. 会计级期初/期末盘点（含本期入库与本期领用包装数、支持过滤0结存） ====================
+// ==================== 8. 会计级期初/期末盘点 ====================
 
 type consumableBaseInfo struct {
 	ID       int64
@@ -2076,7 +2124,7 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ==================== 9. 复用品（类资产全生命周期管理、支持补录修改、预计处置日期与取消报废） ====================
+// ==================== 9. 复用品（类资产全生命周期管理） ====================
 
 func saveUploadedFile(fileHeader io.Reader, origFilename, subFolder, customPrefix string) (string, error) {
 	ext := filepath.Ext(origFilename)
@@ -2351,7 +2399,6 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 管理员补录/修改复用品档案信息（金额、购置日期、预计年限、二级品名、备注、替换实物图）
 	if len(parts) == 1 && r.Method == http.MethodPut {
 		if err := r.ParseMultipartForm(30 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "表单解析失败"})
@@ -2815,7 +2862,7 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 }
 
-// ==================== 11. Excel 专业导出（含本期领用包装数 + 支持隐藏0结存 + 前后结存数量） ====================
+// ==================== 11. Excel 专业导出 ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
@@ -2930,7 +2977,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "办公消耗品入库与领用接续流水账"
 		}
-		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库领用数量", "入库/领用后数量", "倒挤包装数", "采购/领用金额", "单价", "领用人", "备注"}
+		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注"}
 		moneyCols := map[int]bool{12: true, 13: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
 		for i, h := range headers {
