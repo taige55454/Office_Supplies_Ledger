@@ -385,15 +385,18 @@ func verifyRoleToken(token string) (string, bool) {
 }
 
 func getRequestRole(r *http.Request) string {
-	if isLocalRequest(r) {
-		return "admin"
-	}
 	tk := r.Header.Get("X-Auth-Token")
 	if tk == "" {
 		tk = r.URL.Query().Get("token")
 	}
-	if role, ok := verifyRoleToken(tk); ok {
-		return role
+	if tk != "" {
+		if role, ok := verifyRoleToken(tk); ok {
+			return role
+		}
+		return "guest"
+	}
+	if isLocalRequest(r) {
+		return "admin"
 	}
 	return "guest"
 }
