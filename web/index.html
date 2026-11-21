@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>企业办公用品与类资产台账管理系统</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", sans-serif; background: #f1f5f9; color: #1e293b; font-size: 13px; }
+    .hidden { display: none !important; }
+
+    /* 顶部导航栏 */
+    .topbar { background: #ffffff; border-bottom: 1px solid #cbd5e1; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 { font-size: 16px; font-weight: 700; color: #0f172a; }
+    .nav-tabs { display: flex; background: #e2e8f0; padding: 3px; border-radius: 8px; gap: 4px; }
+    .nav-tab { border: none; background: transparent; padding: 6px 14px; border-radius: 6px; font-weight: 600; color: #475569; cursor: pointer; font-size: 13px; }
+    .nav-tab.active { background: #2563eb; color: #fff; }
+    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    .role-pill { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .role-admin { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+    .role-entry { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
+
+    /* 通用按钮与表单控件 */
+    .btn { padding: 6px 12px; border-radius: 5px; border: none; cursor: pointer; font-size: 13px; font-weight: 500; transition: 0.15s; white-space: nowrap; }
+    .btn-sm { padding: 4px 8px; font-size: 12px; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-success { background: #059669; color: #fff; }
+    .btn-warning { background: #d97706; color: #fff; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-outline { background: #fff; border: 1px solid #cbd5e1; color: #334155; }
+    .btn-outline:hover { background: #f8fafc; }
+
+    input, select, textarea { padding: 6px 9px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 13px; font-family: inherit; outline: none; }
+    input:focus, select:focus { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,0.12); }
+
+    /* 主体容器与卡片 */
+    .container { padding: 14px 20px; max-width: 1600px; margin: 0 auto; }
+    .toolbar-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+    .filter-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .stat-card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; }
+    .stat-card .label { color: #64748b; font-size: 12px; margin-bottom: 4px; }
+    .stat-card .value { font-size: 20px; font-weight: 700; color: #0f172a; }
+
+    /* 数据表格 */
+    .table-wrap { background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #e2e8f0; border-right: 1px solid #f1f5f9; padding: 8px 10px; text-align: left; font-size: 12.5px; }
+    th { background: #f8fafc; font-weight: 600; color: #334155; text-align: center; white-space: nowrap; }
+    tr:hover td { background: #f8fafc; }
+    .tc { text-align: center; }
+    .tr { text-align: right; }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .bg-in { background: #dcfce7; color: #166534; }
+    .bg-out { background: #fef3c7; color: #92400e; }
+    .bg-idle { background: #e2e8f0; color: #334155; }
+    .bg-use { background: #dbeafe; color: #1e40af; }
+    .bg-scrap { background: #fee2e2; color: #991b1b; }
+
+    /* 弹窗 */
+    .modal { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.58); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 16px; }
+    .modal-box { background: #fff; width: 100%; max-width: 680px; border-radius: 8px; overflow: hidden; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.2); max-height: 92vh; display: flex; flex-direction: column; }
+    .modal-lg { max-width: 960px; }
+    .modal-head { padding: 12px 18px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; }
+    .modal-body { padding: 16px 18px; overflow-y: auto; }
+    .modal-foot { padding: 10px 18px; background: #f8fafc; border-top: 1px solid #e2e8f0; display: flex; justify-content: flex-end; gap: 8px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .fg { display: flex; flex-direction: column; gap: 4px; }
+    .fg.full { grid-column: span 2; }
+    .fg label { font-size: 12px; font-weight: 600; color: #475569; }
+    .hint-box { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 8px 10px; border-radius: 5px; font-size: 12px; margin-top: 6px; }
+
+    /* A4 打印专用样式：隐藏按钮与筛选栏，保留纯净会计盘点报表 */
+    @media print {
+      .topbar, .toolbar-card, .no-print, .btn { display: none !important; }
+      body { background: #fff; }
+      .container { padding: 0; max-width: 100%; }
+      .table-wrap { border: none; }
+      th, td { border: 1px solid #333 !important; color: #000 !important; }
+      .print-header { display: block !important; text-align: center; margin-bottom: 12px; }
+      .print-footer { display: flex !important; justify-content: space-between; margin-top: 20px; font-size: 12px; }
+    }
+    .print-header, .print-footer { display: none; }
+  </style>
+</head>
+<body>
+
+  <!-- 内网登录鉴权遮罩层 -->
+  <div id="login_overlay" class="modal hidden" style="z-index: 9999; background: rgba(15,23,42,0.88);">
+    <div class="modal-box" style="max-width: 400px;">
+      <div class="modal-head"><h3>🔐 内网台账访问验证</h3></div>
+      <form onsubmit="submitLogin(event)" class="modal-body">
+        <p style="color:#475569; margin-bottom:12px; line-height:1.5;">
+          请输入访问口令：<br/>
+          • 输入<strong>内网登记口令</strong>：仅可登记入库/领用与上传附件<br/>
+          • 输入<strong>管理员口令</strong>：拥有全量修改、盘点与结转权限
+        </p>
+        <div class="fg">
+          <label>验证口令 *</label>
+          <input type="password" id="login_passcode" required autocomplete="off" />
+        </div>
+        <div id="login_err" style="color:#dc2626; font-size:12px; margin-top:6px;" class="hidden"></div>
+        <div style="margin-top:14px;">
+          <button type="submit" class="btn btn-primary" style="width:100%;">验证进入</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 顶部主导航栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span style="font-size:22px;">📦</span>
+      <h1>企业办公用品与类资产台账系统</h1>
+      <div class="nav-tabs">
+        <button id="tab_consumable" class="nav-tab active" onclick="switchTab('consumable')">🧾 消耗品台账与盘点</button>
+        <button id="tab_reusable" class="nav-tab" onclick="switchTab('reusable')">🪑 复用品 (类资产管理)</button>
+        <button id="tab_items" class="nav-tab" onclick="switchTab('items')">📚 用品基础字典</button>
+        <button id="tab_monthly" class="nav-tab" onclick="switchTab('monthly')">📎 月度手写登记附件</button>
+      </div>
+    </div>
+
+    <div class="top-actions">
+      <span id="role_badge" class="role-pill role-admin">本机管理员</span>
+      <button class="btn btn-outline btn-sm admin-only" onclick="openCarryoverModal()">📅 年度结转</button>
+      <button class="btn btn-outline btn-sm admin-only" onclick="openAuditModal()">🛡️ 审计日志</button>
+      <button class="btn btn-outline btn-sm admin-only" onclick="openSettingsModal()">⚙️ 端口与口令设置</button>
+      <button id="btn_logout" class="btn btn-outline btn-sm hidden" onclick="logout()">退出登录</button>
+    </div>
+  </header>
+
+  <div class="container">
+
+    <!-- ==================== 模块一：消耗品台账与盘点 ==================== -->
+    <section id="view_consumable">
+      <div class="toolbar-card">
+        <div class="filter-group">
+          <button class="btn btn-primary" onclick="openConsumableModal('IN')">+ 消耗品入库登记</button>
+          <button class="btn btn-warning" onclick="openConsumableModal('OUT')">- 消耗品领用登记</button>
+          <span style="color:#cbd5e1;">|</span>
+          <select id="c_subview" onchange="refreshConsumableView()">
+            <option value="inventory">📊 盘点统计表 (含期初/期末)</option>
+            <option value="ledger">📜 接续流水明细账</option>
+          </select>
+          <select id="c_filter_cat" onchange="refreshConsumableView()">
+            <option value="">全部分类</option>
+          </select>
+          <select id="c_filter_item" onchange="refreshConsumableView()">
+            <option value="">全部单品</option>
+          </select>
+          <input type="date" id="c_start_date" onchange="refreshConsumableView()" />
+          <span>至</span>
+          <input type="date" id="c_end_date" onchange="refreshConsumableView()" />
+          <button class="btn btn-outline" onclick="setQuickPeriod('month')">本月</button>
+          <button class="btn btn-outline" onclick="setQuickPeriod('year')">本年</button>
+        </div>
+        <div class="filter-group">
+          <button class="btn btn-outline" onclick="window.print()">🖨️ 打印报表</button>
+          <button class="btn btn-success" onclick="exportConsumableExcel()">📥 导出 Excel</button>
+        </div>
+      </div>
+
+      <!-- 分类汇总卡片 -->
+      <div id="c_cat_cards" class="summary-cards"></div>
+
+      <div class="print-header">
+        <h2>企业办公消耗品盘点与接续台账报表</h2>
+        <p id="print_period_label"></p>
+      </div>
+
+      <!-- 子视图A：期初/期末盘点统计表 -->
+      <div id="box_c_inventory" class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>用品分类</th>
+              <th>品名</th>
+              <th>包装换算规格</th>
+              <th>期初结存(基本)</th>
+              <th>期初结存(包装)</th>
+              <th>本期入库(基本)</th>
+              <th>本期领用(基本)</th>
+              <th>期末结存(基本)</th>
+              <th>期末结存(包装)</th>
+              <th>本期采购总额</th>
+              <th>历史采购单价区间</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_c_inventory"></tbody>
+        </table>
+      </div>
+
+      <!-- 子视图B：接续流水账 -->
+      <div id="box_c_ledger" class="table-wrap hidden">
+        <table>
+          <thead>
+            <tr>
+              <th>年度流水号</th>
+              <th>登记日期</th>
+              <th>用品分类</th>
+              <th>品名</th>
+              <th>类型</th>
+              <th>基本数量</th>
+              <th>折算包装数</th>
+              <th>采购总价</th>
+              <th>折算单价</th>
+              <th>领用人</th>
+              <th>备注</th>
+              <th class="admin-only no-print">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_c_ledger"></tbody>
+        </table>
+      </div>
+
+      <div class="print-footer">
+        <span>制表人：_______________</span>
+        <span>复核人：_______________</span>
+        <span>打印时间：<script>document.write(new Date().toLocaleDateString())</script></span>
+      </div>
+    </section>
+
+    <!-- ==================== 模块二：复用品（类资产全生命周期管理） ==================== -->
+    <section id="view_reusable" class="hidden">
+      <div class="toolbar-card">
+        <div class="filter-group">
+          <button class="btn btn-primary" onclick="openReusableInModal()">+ 复用品入库建档 (需传图)</button>
+          <span style="color:#cbd5e1;">|</span>
+          <select id="r_subview" onchange="refreshReusableView()">
+            <option value="assets">🪑 类资产总盘点台账 (一物一码)</option>
+            <option value="logs">📜 全生命周期接续流水记录</option>
+          </select>
+          <select id="r_filter_cat" onchange="refreshReusableView()">
+            <option value="">全部分类</option>
+          </select>
+          <select id="r_filter_status" onchange="refreshReusableView()">
+            <option value="">全部状态</option>
+            <option value="在用">在用</option>
+            <option value="闲置">闲置</option>
+            <option value="报废">报废</option>
+          </select>
+          <input type="text" id="r_filter_kw" placeholder="搜资产编号/二级品名/使用人" oninput="refreshReusableView()" />
+        </div>
+        <div class="filter-group">
+          <button class="btn btn-outline" onclick="window.print()">🖨️ 打印资产表</button>
+          <button class="btn btn-success" onclick="exportReusableExcel()">📥 导出 Excel</button>
+        </div>
+      </div>
+
+      <div id="r_summary_cards" class="summary-cards"></div>
+
+      <!-- 资产主表 -->
+      <div id="box_r_assets" class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>资产编号</th>
+              <th>分类</th>
+              <th>标准品名</th>
+              <th>二级品名 / 位置区分</th>
+              <th>入库日期</th>
+              <th>单价</th>
+              <th>预计年限</th>
+              <th>当前状态</th>
+              <th>当前使用人</th>
+              <th>实物/报废附件</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_r_assets"></tbody>
+        </table>
+      </div>
+
+      <!-- 复用品流转流水记录 -->
+      <div id="box_r_logs" class="table-wrap hidden">
+        <table>
+          <thead>
+            <tr>
+              <th>流转流水号</th>
+              <th>资产编号</th>
+              <th>分类</th>
+              <th>标准品名</th>
+              <th>二级品名</th>
+              <th>动作类型</th>
+              <th>登记日期</th>
+              <th>相关人员</th>
+              <th>变动明细</th>
+              <th>凭证附件</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_r_logs"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== 模块三：用品基础字典 ==================== -->
+    <section id="view_items" class="hidden">
+      <div class="toolbar-card">
+        <div class="filter-group">
+          <button class="btn btn-primary" onclick="openNewItemModal()">+ 新增用品基础信息</button>
+          <select id="i_filter_nature" onchange="loadItems()">
+            <option value="">全部性质</option>
+            <option value="consumable">消耗品</option>
+            <option value="reusable">复用品 (类资产)</option>
+          </select>
+          <input type="text" id="i_filter_kw" placeholder="搜索分类或品名..." oninput="loadItems()" />
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>用品分类</th>
+              <th>品名</th>
+              <th>性质</th>
+              <th>基本单位</th>
+              <th>包装单位</th>
+              <th>包装数量</th>
+              <th>采购价格区间 (自动统计)</th>
+              <th>当前在库/在用数量</th>
+              <th class="admin-only">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_items"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================== 模块四：月度手写登记附件 ==================== -->
+    <section id="view_monthly" class="hidden">
+      <div class="toolbar-card">
+        <div class="filter-group">
+          <button class="btn btn-primary" onclick="openMonthlyUploadModal()">+ 上传月度手写登记附件</button>
+          <input type="month" id="m_filter_ym" onchange="loadMonthlyAttachments()" />
+          <button class="btn btn-outline" onclick="document.getElementById('m_filter_ym').value=''; loadMonthlyAttachments()">全部月份</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>归属年月</th>
+              <th>附件标题</th>
+              <th>原始文件名</th>
+              <th>备注</th>
+              <th>上传时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_monthly"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ==================== 弹窗1：新增/修改用品基础信息 ==================== -->
+  <div id="modal_item" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3 id="modal_item_title">新增用品基础信息</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_item')">✕</button>
+      </div>
+      <form onsubmit="submitItemForm(event)" class="modal-body">
+        <input type="hidden" id="item_edit_id" />
+        <div class="form-grid">
+          <div class="fg">
+            <label>用品分类 * (可下拉或直接手填)</label>
+            <input type="text" id="item_category" list="cat_datalist" required placeholder="如：办公文具、办公耗材、办公家具" />
+            <datalist id="cat_datalist">
+              <option value="办公文具"></option>
+              <option value="办公耗材"></option>
+              <option value="办公家具"></option>
+            </datalist>
+          </div>
+          <div class="fg">
+            <label>品名 * (同分类同性质不可重复)</label>
+            <input type="text" id="item_name" required placeholder="如：黑色中性笔、A4打印纸" />
+          </div>
+          <div class="fg">
+            <label>性质 * (创建后不可更改)</label>
+            <select id="item_nature" required>
+              <option value="consumable">消耗品 (数量流水管理)</option>
+              <option value="reusable">复用品 (一物一码类资产管理)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label>基本单位 * (最小计量单位)</label>
+            <input type="text" id="item_base_unit" required placeholder="如：支、张、包、把" />
+          </div>
+          <div class="fg">
+            <label>包装单位 (整箱/整盒单位)</label>
+            <input type="text" id="item_pack_unit" placeholder="如：盒、箱、提" />
+          </div>
+          <div class="fg">
+            <label>包装数量 (1包装等于多少基本单位)</label>
+            <input type="number" step="0.01" id="item_pack_size" value="1" required />
+          </div>
+          <div class="fg full">
+            <label>采购价格区间 (预留字段，由后续入库单自动折算汇总)</label>
+            <input type="text" disabled value="系统自动根据入库单折算统计，无需手动填写" style="background:#f1f5f9; color:#64748b;" />
+          </div>
+          <div id="item_admin_verify_box" class="fg full hidden">
+            <div class="hint-box">⚠️ 修改基础用品后，已登记的历史台账数量将以【基本数量】为准，按新的包装数量自动重新折算！</div>
+            <label style="margin-top:8px;">管理员确认口令 *</label>
+            <input type="password" id="item_admin_pass" placeholder="请输入管理员口令以确认变更" />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_item')">取消</button>
+          <button type="submit" class="btn btn-primary">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗2：消耗品入库 / 领用登记 ==================== -->
+  <div id="modal_consumable" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3 id="modal_c_title">消耗品入库登记</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_consumable')">✕</button>
+      </div>
+      <form onsubmit="submitConsumableForm(event)" class="modal-body">
+        <input type="hidden" id="c_tx_type" />
+        <div class="form-grid">
+          <div class="fg">
+            <label>筛选分类</label>
+            <select id="c_form_cat" onchange="filterConsumableItemSelect()"></select>
+          </div>
+          <div class="fg">
+            <label>选择品名 *</label>
+            <select id="c_form_item" required onchange="onSelectConsumableItem()"></select>
+          </div>
+          <div class="fg full">
+            <div id="c_item_info_banner" style="background:#eff6ff; border:1px solid #bfdbfe; padding:8px 10px; border-radius:5px; color:#1e40af; font-size:12px;">
+              请选择具体品名以带出单位换算规格与当前结存...
+            </div>
+          </div>
+          <div class="fg">
+            <label>登记日期 *</label>
+            <input type="date" id="c_form_date" required />
+          </div>
+          <div class="fg">
+            <label id="c_label_base">基本数量 *</label>
+            <input type="number" step="0.01" id="c_form_base_qty" required oninput="onBaseQtyInput()" />
+          </div>
+          <div class="fg">
+            <label id="c_label_pack">包装数量 (填写任一自动换算)</label>
+            <input type="number" step="0.01" id="c_form_pack_qty" oninput="onPackQtyInput()" />
+          </div>
+          <div class="fg" id="c_amount_group">
+            <label>采购总价 (元，自动折算单价)</label>
+            <input type="number" step="0.01" id="c_form_amount" oninput="onTotalAmountInput()" />
+          </div>
+          <div class="fg hidden" id="c_recipient_group">
+            <label>领用人 * (可选历史最近10人或手填)</label>
+            <input type="text" id="c_form_recipient" list="recipients_datalist" placeholder="输入或选择领用人" />
+            <datalist id="recipients_datalist"></datalist>
+          </div>
+          <div class="fg full">
+            <div id="c_pack_mismatch_tip" class="hint-box hidden"></div>
+          </div>
+          <div class="fg full">
+            <label>备注</label>
+            <input type="text" id="c_form_remark" />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_consumable')">取消</button>
+          <button type="submit" class="btn btn-primary">确认登记</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗3：修正消耗品流水记录（管理员严格验证） ==================== -->
+  <div id="modal_edit_ledger" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3 id="edit_ledger_title">修正流水记录</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_edit_ledger')">✕</button>
+      </div>
+      <form onsubmit="submitEditLedgerForm(event)" class="modal-body">
+        <input type="hidden" id="el_id" />
+        <div class="form-grid">
+          <div class="fg">
+            <label>登记日期 *</label>
+            <input type="date" id="el_date" required />
+          </div>
+          <div class="fg">
+            <label>基本数量 *</label>
+            <input type="number" step="0.01" id="el_base_qty" required />
+          </div>
+          <div class="fg" id="el_amt_box">
+            <label>采购总价 (元)</label>
+            <input type="number" step="0.01" id="el_amount" />
+          </div>
+          <div class="fg" id="el_recip_box">
+            <label>领用人</label>
+            <input type="text" id="el_recipient" list="recipients_datalist" />
+          </div>
+          <div class="fg full">
+            <label>备注</label>
+            <input type="text" id="el_remark" />
+          </div>
+          <div class="fg full">
+            <div class="hint-box">🔒 笔误修正属于敏感操作，系统将验证管理员口令并自动留存操作审计日志。</div>
+            <label style="margin-top:6px;">管理员口令 *</label>
+            <input type="password" id="el_admin_pass" required />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_edit_ledger')">取消</button>
+          <button type="submit" class="btn btn-primary">确认修正</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗4：复用品入库建档 ==================== -->
+  <div id="modal_reusable_in" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>🪑 复用品 (类资产) 入库建档</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_reusable_in')">✕</button>
+      </div>
+      <form onsubmit="submitReusableInForm(event)" class="modal-body">
+        <div class="form-grid">
+          <div class="fg">
+            <label>选择复用品品名 *</label>
+            <select id="ri_item_id" required></select>
+          </div>
+          <div class="fg">
+            <label>二级品名 / 位置区分 (如：财务室靠窗椅)</label>
+            <input type="text" id="ri_sub_name" placeholder="方便区分多张桌子/椅子" />
+          </div>
+          <div class="fg">
+            <label>入库数量 (每件自动生成独立资产编号) *</label>
+            <input type="number" id="ri_qty" value="1" min="1" max="100" required />
+          </div>
+          <div class="fg">
+            <label>采购总价 (元，自动折算单件价格)</label>
+            <input type="number" step="0.01" id="ri_total_amount" value="0" />
+          </div>
+          <div class="fg">
+            <label>入库日期 *</label>
+            <input type="date" id="ri_purchase_date" required />
+          </div>
+          <div class="fg">
+            <label>预计使用年限 (默认 10 年，到期不自动报废)</label>
+            <input type="number" id="ri_expected_years" value="10" min="1" max="50" required />
+          </div>
+          <div class="fg full">
+            <label>上传对应实物图片附件 * (必填)</label>
+            <input type="file" id="ri_image_file" accept="image/*" required />
+          </div>
+          <div class="fg full">
+            <label>备注</label>
+            <input type="text" id="ri_remark" />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_reusable_in')">取消</button>
+          <button type="submit" class="btn btn-primary">生成资产台账</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗5：复用品领用 / 变更使用人 / 报废登记 ==================== -->
+  <div id="modal_reusable_action" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3 id="ra_title">资产流转登记</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_reusable_action')">✕</button>
+      </div>
+      <form onsubmit="submitReusableActionForm(event)" class="modal-body">
+        <input type="hidden" id="ra_asset_id" />
+        <input type="hidden" id="ra_action" />
+        <div class="form-grid">
+          <div class="fg">
+            <label>登记日期 *</label>
+            <input type="date" id="ra_date" required />
+          </div>
+          <div class="fg" id="ra_user_box">
+            <label>领用人 / 新使用人 *</label>
+            <input type="text" id="ra_user" list="recipients_datalist" />
+          </div>
+          <div class="fg full hidden" id="ra_scrap_file_box">
+            <label>报废审批文件 / 现场凭证附件 * (报废必填)</label>
+            <input type="file" id="ra_scrap_file" />
+          </div>
+          <div class="fg full">
+            <label>流转说明 / 备注</label>
+            <input type="text" id="ra_remark" />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_reusable_action')">取消</button>
+          <button type="submit" class="btn btn-primary">确认提交留痕</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗6：查看单个资产流转履历 ==================== -->
+  <div id="modal_asset_logs" class="modal hidden">
+    <div class="modal-box modal-lg">
+      <div class="modal-head">
+        <h3 id="al_title">资产全生命周期流转记录</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_asset_logs')">✕</button>
+      </div>
+      <div class="modal-body">
+        <table>
+          <thead>
+            <tr>
+              <th>流转编号</th>
+              <th>动作类型</th>
+              <th>日期</th>
+              <th>使用人/经办人</th>
+              <th>详细记录</th>
+              <th>凭证</th>
+            </tr>
+          </thead>
+          <tbody id="tbody_single_asset_logs"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗7：上传月度手写登记附件 ==================== -->
+  <div id="modal_monthly_upload" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>📎 上传月度原始手写登记文件</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_monthly_upload')">✕</button>
+      </div>
+      <form onsubmit="submitMonthlyUpload(event)" class="modal-body">
+        <div class="form-grid">
+          <div class="fg">
+            <label>归属月份 *</label>
+            <input type="month" id="mu_ym" required />
+          </div>
+          <div class="fg">
+            <label>文件标题 *</label>
+            <input type="text" id="mu_title" required placeholder="如：2026年11月办公用品手写领用登记汇总" />
+          </div>
+          <div class="fg full">
+            <label>选择扫描件 / PDF / 照片 *</label>
+            <input type="file" id="mu_file" required />
+          </div>
+          <div class="fg full">
+            <label>备注</label>
+            <input type="text" id="mu_remark" />
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_monthly_upload')">取消</button>
+          <button type="submit" class="btn btn-primary">确认上传归档</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗8：年度结转弹窗 ==================== -->
+  <div id="modal_carryover" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>📅 会计式年度结转</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_carryover')">✕</button>
+      </div>
+      <form onsubmit="submitCarryover(event)" class="modal-body">
+        <div class="hint-box" style="margin-bottom:12px;">
+          • <strong>消耗品</strong>：将指定年份 12月31日 的期末结存固化为次年 01月01日 的期初库存，次年流水编号重新从 <code>XH-次年-000001</code> 起编。<br/>
+          • <strong>复用品</strong>：不重置独立资产编号，自动统计当前【在用】与【报废】资产快照结转至次年。
+        </div>
+        <div class="form-grid">
+          <div class="fg">
+            <label>结转年份 *</label>
+            <input type="number" id="co_year" required />
+          </div>
+          <div class="fg">
+            <label>管理员口令 *</label>
+            <input type="password" id="co_pass" required />
+          </div>
+        </div>
+        <div id="co_history_box" style="margin-top:12px; font-size:12px; color:#475569;"></div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_carryover')">取消</button>
+          <button type="submit" class="btn btn-primary">执行年度结转</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗9：系统端口与双口令设置 ==================== -->
+  <div id="modal_settings" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>⚙️ 内网端口与双级权限口令设置</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_settings')">✕</button>
+      </div>
+      <form onsubmit="submitSettings(event)" class="modal-body">
+        <div class="form-grid">
+          <div class="fg">
+            <label>HTTP 监听端口 (1024~65535，修改后热重启)</label>
+            <input type="number" id="set_port" min="1024" max="65535" required />
+          </div>
+          <div class="fg" style="justify-content:center;">
+            <label style="display:flex; align-items:center; gap:6px; cursor:pointer; margin-top:18px;">
+              <input type="checkbox" id="set_allow_lan" style="width:auto;" />
+              允许局域网其他电脑访问
+            </label>
+          </div>
+          <div class="fg">
+            <label>内网登记员口令 (仅可登记和上传，禁删改)</label>
+            <input type="text" id="set_entry_pass" required />
+          </div>
+          <div class="fg">
+            <label>管理员口令 (全量管理与修改验证)</label>
+            <input type="text" id="set_admin_pass" required />
+          </div>
+          <div class="fg full">
+            <label>内网共享访问地址</label>
+            <div id="set_lan_urls" style="background:#f8fafc; border:1px solid #cbd5e1; padding:8px; border-radius:5px; font-family:monospace; color:#1d4ed8;"></div>
+          </div>
+        </div>
+        <div class="modal-foot" style="margin-top:14px;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal_settings')">取消</button>
+          <button type="submit" class="btn btn-primary">保存并生效</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==================== 弹窗10：操作审计日志 ==================== -->
+  <div id="modal_audit" class="modal hidden">
+    <div class="modal-box modal-lg">
+      <div class="modal-head">
+        <h3>🛡️ 敏感操作审计日志 (最近100条)</h3>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal_audit')">✕</button>
+      </div>
+      <div class="modal-body">
+        <table>
+          <thead><tr><th>时间</th><th>操作类型</th><th>目标对象</th><th>变更详情</th></tr></thead>
+          <tbody id="tbody_audit"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
