@@ -8,7 +8,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/xuri/excelize/v2"
@@ -50,7 +49,7 @@ func TestFullBusinessRegression(t *testing.T) {
 	_ = json.NewDecoder(resp1.Body).Decode(&createItemRes)
 	itemID := int64(createItemRes["id"].(float64))
 
-	// ==================== 2. 基本数量强制整数 + 移动加权平均成本 + 包装尾差自动倒挤 ====================
+	// ==================== 2. 基本数量强制整数 + 每次登记实时动态倒挤包装尾差 ====================
 	// 2.1 小数基本数量必须拦截
 	decPayload, _ := json.Marshal(map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.96, "total_amount": 10,
@@ -60,33 +59,35 @@ func TestFullBusinessRegression(t *testing.T) {
 		t.Fatalf("小数基本数量必须被拦截，实际状态码: %d", respDec.StatusCode)
 	}
 
-	// 2.2 首批入库 12 支（1盒），总价 24 元（单价 2 元）
+	// 2.2 入库 24 支（2盒），总价 72 元（单价 3 元）
 	in1, _ := json.Marshal(map[string]interface{}{
-		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 12, "total_amount": 24,
+		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 24, "total_amount": 72,
 	})
 	_, _ = http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(in1))
 
-	// 2.3 二批入库 12 支（1盒），总价 48 元（单价 4 元），此时共 24 支，移动加权均价 3 元，总价值 72 元
-	in2, _ := json.Marshal(map[string]interface{}{
-		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-15", "base_qty": 12, "total_amount": 48,
-	})
-	_, _ = http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(in2))
-
-	// 2.4 分 6 次每次领用 4 支（共 24 支全部领完，每次显示 0.33 盒）
-	for i := 1; i <= 6; i++ {
+	// 2.3 连续 3 次每次领用 4 支（共 12 支，仍有 12 支在库未消耗完）
+	// 验证每次登记实时倒挤包装数：第1笔=0.33，第2笔=0.34，第3笔=0.33，三笔之和严格等于 1.00 盒（无任何尾差！）
+	var packSteps []float64
+	for i := 1; i <= 3; i++ {
 		outP, _ := json.Marshal(map[string]interface{}{
 			"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-20", "base_qty": 4, "recipient": fmt.Sprintf("领用人%d", i),
 		})
-		_, _ = http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(outP))
+		respOut, _ := http.Post(baseURL+"/api/consumables/ledger", "application/json", bytes.NewReader(outP))
+		var outRes map[string]interface{}
+		_ = json.NewDecoder(respOut.Body).Decode(&outRes)
+		packSteps = append(packSteps, outRes["reconciled_pack_qty"].(float64))
+	}
+	if packSteps[0] != 0.33 || packSteps[1] != 0.34 || packSteps[2] != 0.33 {
+		t.Fatalf("期望每次登记实时倒挤包装数为 [0.33, 0.34, 0.33]，实际: %v", packSteps)
 	}
 
-	// 验证全部领完后：期末结存基本数=0，包装数自动倒挤=0，在库价值=0（无任何尾差残留）
+	// 验证此时库存余值：剩余 12 支（1盒），移动加权余值 36 元
 	respInv, _ := http.Get(fmt.Sprintf("%s/api/consumables/inventory?start_date=2026-03-01&end_date=2026-03-31&item_id=%d", baseURL, itemID))
 	var invRes map[string]interface{}
 	_ = json.NewDecoder(respInv.Body).Decode(&invRes)
 	itStat := invRes["items"].([]interface{})[0].(map[string]interface{})
-	if itStat["closing_base_qty"].(float64) != 0 || itStat["closing_pack_qty"].(float64) != 0 || itStat["closing_value"].(float64) != 0 {
-		t.Fatalf("全部领完后应无任何包装与金额尾差，实际: %+v", itStat)
+	if itStat["closing_base_qty"].(float64) != 12 || itStat["closing_pack_qty"].(float64) != 1.0 || itStat["closing_value"].(float64) != 36.0 {
+		t.Fatalf("在库余值与包装结存核算异常: %+v", itStat)
 	}
 
 	// ==================== 3. 采购价格正态/频率分布直方图接口 ====================
@@ -98,7 +99,6 @@ func TestFullBusinessRegression(t *testing.T) {
 	}
 
 	// ==================== 4. 连续登记时序校验（禁止普通权限倒插补登前期记录） ====================
-	// 已有 2026-03-20 记录，尝试补录 2026-03-18 入库（无管理员口令）必须返回 409
 	backInNoPass, _ := json.Marshal(map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-18", "base_qty": 10, "total_amount": 30,
 	})
@@ -107,7 +107,6 @@ func TestFullBusinessRegression(t *testing.T) {
 		t.Fatalf("在已有更晚日期记录时补登前期记录应被 409 拦截，实际: %d", respBack1.StatusCode)
 	}
 
-	// 携带管理员最高权限口令授权补录必须成功
 	backInWithPass, _ := json.Marshal(map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-18", "base_qty": 10, "total_amount": 30, "admin_passcode": "888888",
 	})
@@ -120,7 +119,6 @@ func TestFullBusinessRegression(t *testing.T) {
 	coPayload, _ := json.Marshal(map[string]interface{}{"carry_year": 2026, "admin_passcode": "888888"})
 	_, _ = http.Post(baseURL+"/api/carryover", "application/json", bytes.NewReader(coPayload))
 
-	// 结转后尝试登记 2026 年流水（无口令）必须被拦截
 	lockedYearTx, _ := json.Marshal(map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-12-25", "base_qty": 5, "total_amount": 15,
 	})
@@ -129,7 +127,6 @@ func TestFullBusinessRegression(t *testing.T) {
 		t.Fatalf("已结转年度补录应被 409 拦截，实际: %d", respLockedYear.StatusCode)
 	}
 
-	// 管理员撤销 2026 年度结转
 	reqCancelCo, _ := http.NewRequest(http.MethodDelete, baseURL+"/api/carryover?carry_year=2026&admin_passcode=888888", nil)
 	respCancelCo, _ := http.DefaultClient.Do(reqCancelCo)
 	if respCancelCo.StatusCode != 200 {
@@ -152,7 +149,6 @@ func TestFullBusinessRegression(t *testing.T) {
 	var assetID int64
 	_ = db.QueryRow(`SELECT id FROM reusable_assets LIMIT 1`).Scan(&assetID)
 
-	// 报废
 	var bufScrap bytes.Buffer
 	mwS := multipart.NewWriter(&bufScrap)
 	_ = mwS.WriteField("action", "SCRAP")
@@ -161,7 +157,6 @@ func TestFullBusinessRegression(t *testing.T) {
 	_ = mwS.Close()
 	_, _ = http.Post(fmt.Sprintf("%s/api/reusables/assets/%d/transition", baseURL, assetID), mwS.FormDataContentType(), &bufScrap)
 
-	// 取消报废（错误口令拦截 + 正确口令恢复为闲置）
 	var bufUnscrapBad bytes.Buffer
 	mwU1 := multipart.NewWriter(&bufUnscrapBad)
 	_ = mwU1.WriteField("action", "UNSCRAP")
