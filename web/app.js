@@ -11,6 +11,7 @@ let authState = {
 let allItems = [];
 let allRecipients = [];
 let cachedReusableAssets = [];
+let cachedInventoryItems = [];
 let currentInspectingAsset = null;
 let currentPrintMode = 'consumable_inventory';
 
@@ -314,7 +315,7 @@ function onTxItemChange() {
   const spec = it.pack_unit ? `1 ${it.pack_unit} = ${it.pack_size} ${it.base_unit}` : `最小单位：${it.base_unit}`;
   document.getElementById('tx-item-spec-banner').innerHTML =
     `规格：<strong>${spec}</strong> &nbsp;|&nbsp; 当前可用结存：<strong>${it.stock_qty} ${it.base_unit}</strong> &nbsp;|&nbsp; 在库价值：<strong>${(it.stock_value || 0).toFixed(2)} 元</strong>`;
-  document.getElementById('tx-base-label').textContent = `基本数量 (${it.base_unit}，必须为整数) *`;
+  document.getElementById('tx-base-label').textContent = `入库领用数量 (${it.base_unit}，必须为整数) *`;
   document.getElementById('tx-pack-label').textContent = `参考包装数量 (${it.pack_unit || '件'}，填写可自动算基本数量)`;
   onBaseQtyInput();
 }
@@ -383,7 +384,7 @@ async function submitConsumableTx() {
   const rawQty = document.getElementById('tx-base-qty').value;
   const bQty = Number(rawQty);
   if (!rawQty || !Number.isInteger(bQty) || bQty <= 0) {
-    alert('基本数量必须为大于 0 的整数！');
+    alert('入库领用数量必须为大于 0 的整数！');
     return;
   }
 
@@ -428,11 +429,14 @@ async function loadConsumableData() {
   const end = document.getElementById('inv-end-date').value;
   const cat = document.getElementById('inv-category').value;
   const itemId = document.getElementById('inv-item-id').value;
+  const hideZero = document.getElementById('inv-hide-zero').checked ? '1' : '0';
 
-  const qs = new URLSearchParams({ start_date: start, end_date: end, category: cat, item_id: itemId });
+  const qs = new URLSearchParams({ start_date: start, end_date: end, category: cat, item_id: itemId, hide_zero: hideZero });
   const resp = await apiFetch(`/api/consumables/inventory?${qs.toString()}`);
   const res = await resp.json();
   if (!res.success) return;
+
+  cachedInventoryItems = res.items || [];
 
   const catCards = document.getElementById('consumable-cat-cards');
   const totalStockValue = (res.category_summary || []).reduce((acc, c) => acc + (c.total_closing_value || 0), 0);
@@ -451,12 +455,12 @@ async function loadConsumableData() {
   `).join('');
 
   const tbody = document.getElementById('tbody-consumable-inv');
-  tbody.innerHTML = (res.items || []).map(it => {
+  tbody.innerHTML = cachedInventoryItems.map(it => {
     const priceBtn = it.price_range !== '暂无入库价'
       ? `<button class="price-link" onclick="openPriceDistModal(${it.item_id})">${it.price_range} 📊</button>`
       : `<span class="hint-text">暂无入库价</span>`;
     return `
-      <tr>
+      <tr data-closing-qty="${it.closing_base_qty}">
         <td>${it.seq}</td>
         <td>${it.category}</td>
         <td><strong>${it.item_name}</strong></td>
@@ -468,6 +472,7 @@ async function loadConsumableData() {
         <td class="col-qty" style="color:#059669;">${it.in_base_qty}</td>
         <td class="col-qty" style="color:#059669;">${it.in_pack_qty}</td>
         <td class="col-qty" style="color:#dc2626;">${it.out_base_qty}</td>
+        <td class="col-qty" style="color:#dc2626;">${it.out_pack_qty}</td>
         <td class="col-qty" style="background:#eff6ff;"><strong>${it.closing_base_qty}</strong></td>
         <td class="col-qty" style="background:#eff6ff;">${it.closing_pack_qty}</td>
         <td class="col-money">${(it.moving_avg_price || 0).toFixed(2)}</td>
@@ -574,7 +579,7 @@ async function submitEditLedger() {
   const id = document.getElementById('edit-ledger-id').value;
   const bQty = Number(document.getElementById('edit-ledger-qty').value);
   if (!Number.isInteger(bQty) || bQty <= 0) {
-    alert('基本数量必须为正整数！');
+    alert('入库领用数量必须为正整数！');
     return;
   }
   const payload = {
@@ -669,7 +674,7 @@ async function openPriceDistModal(itemID) {
   document.getElementById('modal-price-dist').classList.remove('hidden');
 }
 
-// ==================== 5. 复用品（类资产全生命周期 + 单价年限分列 + 预计处置日期 + 履历打印导出） ====================
+// ==================== 5. 复用品（类资产全生命周期 + 管理员补录修改 + 预计处置日期 + 履历打印导出） ====================
 
 function openReusableInModal() {
   const reusables = allItems.filter(i => i.nature === 'reusable');
@@ -712,6 +717,58 @@ async function submitReusableIn() {
   await loadReusableAssets();
 }
 
+function openReusableEditModal(assetID) {
+  const assetObj = cachedReusableAssets.find(x => x.id === assetID);
+  if (!assetObj) return;
+  const reusables = allItems.filter(i => i.nature === 'reusable');
+  document.getElementById('ra-edit-id').value = assetObj.id;
+  document.getElementById('ra-edit-title').textContent = `✏️ 补录 / 修改类资产档案 (${assetObj.asset_no})`;
+  document.getElementById('ra-edit-item-id').innerHTML = reusables.map(i =>
+    `<option value="${i.id}" ${i.id === assetObj.item_id ? 'selected' : ''}>[${i.category}] ${i.name}</option>`
+  ).join('');
+  document.getElementById('ra-edit-subname').value = assetObj.sub_name || '';
+  document.getElementById('ra-edit-date').value = assetObj.purchase_date || todayStr();
+  document.getElementById('ra-edit-price').value = assetObj.unit_price || 0;
+  document.getElementById('ra-edit-years').value = assetObj.expected_years || 10;
+  document.getElementById('ra-edit-file').value = '';
+  document.getElementById('ra-edit-remark').value = assetObj.remark || '';
+  document.getElementById('ra-edit-pass').value = '';
+  document.getElementById('modal-reusable-edit').classList.remove('hidden');
+}
+
+async function submitReusableEdit() {
+  const id = document.getElementById('ra-edit-id').value;
+  const pass = document.getElementById('ra-edit-pass').value.trim();
+  if (!pass) {
+    alert('修改或补录类资产档案需要输入管理员口令！');
+    return;
+  }
+  const fd = new FormData();
+  fd.append('item_id', document.getElementById('ra-edit-item-id').value);
+  fd.append('sub_name', document.getElementById('ra-edit-subname').value.trim());
+  fd.append('purchase_date', document.getElementById('ra-edit-date').value);
+  fd.append('unit_price', document.getElementById('ra-edit-price').value);
+  fd.append('expected_years', document.getElementById('ra-edit-years').value);
+  fd.append('remark', document.getElementById('ra-edit-remark').value.trim());
+  fd.append('admin_passcode', pass);
+
+  const fileInput = document.getElementById('ra-edit-file');
+  if (fileInput.files && fileInput.files.length > 0) {
+    fd.append('image_file', fileInput.files[0]);
+  }
+
+  const resp = await apiFetch(`/api/reusables/assets/${id}`, { method: 'PUT', body: fd });
+  const res = await resp.json();
+  if (!res.success) {
+    alert(res.message);
+    return;
+  }
+  alert(res.message);
+  closeModal('modal-reusable-edit');
+  await loadItems();
+  await loadReusableAssets();
+}
+
 async function loadReusableAssets() {
   const cat = document.getElementById('ra-category').value;
   const st = document.getElementById('ra-status').value;
@@ -743,6 +800,9 @@ async function loadReusableAssets() {
       : '-';
 
     let ops = `<button class="btn btn-sm btn-outline" onclick="openAssetLogsModal(${a.id})">📜 履历</button> `;
+    if (authState.role === 'admin') {
+      ops += `<button class="btn btn-sm btn-outline" onclick="openReusableEditModal(${a.id})">✏️ 编辑</button> `;
+    }
     if (a.status === '闲置') {
       ops += `<button class="btn btn-sm btn-primary" onclick="openAssetTransitionModal(${a.id}, 'ASSIGN', '${a.asset_no}', '')">📤 首次领用</button> `;
       ops += `<button class="btn btn-sm btn-danger" onclick="openAssetTransitionModal(${a.id}, 'SCRAP', '${a.asset_no}', '')">🗑️ 报废</button>`;
@@ -1063,7 +1123,7 @@ async function loadAuditLogs() {
   `).join('');
 }
 
-// ==================== 8. 自定义打印（右上角金额单位：元 + 所有列缩放到一页 + 居中/金额右对齐） ====================
+// ==================== 8. 自定义打印（右上角金额单位：元 + 所有列缩放到一页 + 隐藏0结存选项） ====================
 
 function openPrintPreview(mode) {
   currentPrintMode = mode;
@@ -1075,17 +1135,20 @@ function openPrintPreview(mode) {
   let tableHtml = document.getElementById('table-consumable-inv').outerHTML;
   let cardsHtml = document.getElementById('consumable-cat-cards').outerHTML;
   let hasCardsOption = true;
+  let hasZeroFilterOption = true;
 
   if (mode === 'consumable_ledger') {
     defaultTitle = '办公消耗品入库与领用接续流水账';
     tableHtml = document.getElementById('table-consumable-ledger').outerHTML;
     cardsHtml = '';
     hasCardsOption = false;
+    hasZeroFilterOption = false;
   } else if (mode === 'reusable_assets') {
     defaultTitle = '企业复用品（类资产）独立编码盘点台账';
     subRightMeta = `盘点日期：${todayStr()} &nbsp;&nbsp;|&nbsp;&nbsp; <strong>金额单位：元</strong>`;
     tableHtml = document.getElementById('table-reusable-assets').outerHTML;
     cardsHtml = document.getElementById('reusable-summary-cards').outerHTML;
+    hasZeroFilterOption = false;
   } else if (mode === 'reusable_single_logs') {
     const aNo = currentInspectingAsset ? currentInspectingAsset.asset_no : '';
     const aName = currentInspectingAsset ? currentInspectingAsset.item_name : '';
@@ -1096,16 +1159,28 @@ function openPrintPreview(mode) {
       document.getElementById('table-single-asset-logs').outerHTML;
     cardsHtml = '';
     hasCardsOption = false;
+    hasZeroFilterOption = false;
   }
 
   document.getElementById('print-org-input').value = authState.org_name || '综合行政部';
   document.getElementById('print-title-input').value = defaultTitle;
   document.getElementById('print-include-cards').checked = false;
+
+  const mainHideZero = document.getElementById('inv-hide-zero').checked;
+  document.getElementById('print-hide-zero').checked = mainHideZero;
+
   const toggleWrap = document.getElementById('print-cards-toggle-wrap');
   if (hasCardsOption) {
     toggleWrap.classList.remove('hidden');
   } else {
     toggleWrap.classList.add('hidden');
+  }
+
+  const zeroWrap = document.getElementById('print-hide-zero-wrap');
+  if (hasZeroFilterOption) {
+    zeroWrap.classList.remove('hidden');
+  } else {
+    zeroWrap.classList.add('hidden');
   }
 
   const area = document.getElementById('print-preview-area');
@@ -1151,8 +1226,30 @@ function openPrintPreview(mode) {
 
   refreshPrintHeader();
   refreshPrintCards();
+  if (hasZeroFilterOption) {
+    refreshPrintHideZero();
+  }
   document.getElementById('modal-print-preview').classList.remove('hidden');
   setTimeout(applyPrintLayout, 60);
+}
+
+function refreshPrintHideZero() {
+  const hideZero = document.getElementById('print-hide-zero').checked;
+  const tbl = document.querySelector('#print-preview-area #table-consumable-inv');
+  if (!tbl) return;
+  let seq = 0;
+  tbl.querySelectorAll('tbody tr').forEach(tr => {
+    const closingQty = parseInt(tr.getAttribute('data-closing-qty') || '0', 10);
+    if (hideZero && closingQty === 0) {
+      tr.style.display = 'none';
+    } else {
+      tr.style.display = '';
+      seq++;
+      const firstCell = tr.querySelector('td');
+      if (firstCell) firstCell.textContent = String(seq);
+    }
+  });
+  applyPrintLayout();
 }
 
 function refreshPrintHeader() {
@@ -1209,11 +1306,13 @@ function exportExcel(mode) {
   const start = document.getElementById('inv-start-date').value;
   const end = document.getElementById('inv-end-date').value;
   const orgName = authState.org_name || '综合行政部';
+  const hideZero = document.getElementById('inv-hide-zero').checked ? '1' : '0';
   const qs = new URLSearchParams({
     mode: mode,
     start_date: start,
     end_date: end,
-    org_name: orgName
+    org_name: orgName,
+    hide_zero: hideZero
   });
   if (authState.token) {
     qs.set('token', authState.token);
