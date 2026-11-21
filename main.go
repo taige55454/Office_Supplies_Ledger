@@ -942,7 +942,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	needRestart := oldPort != req.Port
+	needRestart := oldPort != req.Port && req.Port != currentPort
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":      true,
 		"need_restart": needRestart,
