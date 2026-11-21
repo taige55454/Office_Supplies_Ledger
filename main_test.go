@@ -69,33 +69,28 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	// =========================================================================
 	// 模块 1：鉴权、RBAC 角色隔离（登记员只读/录入 vs 管理员全权限）与路径穿越安全
 	// =========================================================================
-	// 1.1 错误口令拦截
 	respBadLogin, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "wrongpass"})
 	if respBadLogin.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("错误口令应返回 401，实际: %d", respBadLogin.StatusCode)
 	}
 
-	// 1.2 内网登记员登录获取 token
 	respEntryLogin, entryLoginRes := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "666666"})
 	if respEntryLogin.StatusCode != http.StatusOK || entryLoginRes["role"] != "entry" {
 		t.Fatalf("内网登记员登录失败: %+v", entryLoginRes)
 	}
 	entryToken := entryLoginRes["token"].(string)
 
-	// 1.3 管理员登录获取 token
 	respAdminLogin, adminLoginRes := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "888888"})
 	if respAdminLogin.StatusCode != http.StatusOK || adminLoginRes["role"] != "admin" {
 		t.Fatalf("管理员登录失败: %+v", adminLoginRes)
 	}
 	adminToken := adminLoginRes["token"].(string)
 
-	// 1.4 携带无效 token 模拟局域网未授权访客被拦截
 	respGuest, _ := doJSONReq(t, http.MethodGet, baseURL+"/api/items", "invalid|token|sig", nil)
 	if respGuest.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("无效 token 必须返回 401，实际: %d", respGuest.StatusCode)
 	}
 
-	// 1.5 登记员越权修改系统设置、执行结转、执行 PUT 修改必须被拦截 (403)
 	respEntryPut, _ := doJSONReq(t, http.MethodPut, baseURL+"/api/items/1", entryToken, map[string]interface{}{"name": "非法修改"})
 	if respEntryPut.StatusCode != http.StatusForbidden {
 		t.Fatalf("登记员 PUT 修改必须被拦截 (403)，实际: %d", respEntryPut.StatusCode)
@@ -105,14 +100,15 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("登记员修改设置必须被拦截 (403)，实际: %d", respEntrySet.StatusCode)
 	}
 
-	// 1.6 附件目录路径穿越攻击拦截
-	respTraversal, _ := http.Get(baseURL + "/attachments/..%2Fconfig.json")
+	respTraversal, err := http.Get(baseURL + "/attachments/..%2Fconfig.json")
+	if err != nil {
+		t.Fatalf("路径穿越测试请求异常: %v", err)
+	}
 	_ = respTraversal.Body.Close()
 	if respTraversal.StatusCode != http.StatusForbidden && respTraversal.StatusCode != http.StatusNotFound {
 		t.Fatalf("路径穿越必须被拦截，实际状态码: %d", respTraversal.StatusCode)
 	}
 
-	// 1.7 管理员更新单位名称
 	respSetOk, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/settings", adminToken, map[string]interface{}{
 		"port":           currentPort,
 		"admin_passcode": "888888",
@@ -136,7 +132,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 	itemID := int64(createItemRes["id"].(float64))
 
-	// 2.1 同分类同性质同名重复拦截 (409)
 	respDupItem, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
 		"base_unit": "支", "pack_unit": "盒", "pack_size": 12,
@@ -145,7 +140,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("同名用品重复新增必须返回 409，实际: %d", respDupItem.StatusCode)
 	}
 
-	// 2.2 小数基本数量拦截 (400)
 	respDec, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.5, "total_amount": 10,
 	})
@@ -156,12 +150,10 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	// =========================================================================
 	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截
 	// =========================================================================
-	// 3.1 入库 24 支（2盒），总价 72 元（单价 3.00 元） -> XH-2026-000001
 	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 24, "total_amount": 72,
 	})
 
-	// 3.2 连续 3 次每次领用 4 支 -> XH-2026-000002, 000003, 000004，倒挤包装应为 [0.33, 0.34, 0.33]
 	var packSteps []float64
 	for i := 1; i <= 3; i++ {
 		_, outRes := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
@@ -173,7 +165,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("期望实时倒挤包装数为 [0.33, 0.34, 0.33]，实际: %v", packSteps)
 	}
 
-	// 3.3 超出库存领用拦截（当前结存 12 支，尝试领用 15 支）
 	respOverOut, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-21", "base_qty": 15, "recipient": "超领人",
 	})
@@ -181,7 +172,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("超库存领用必须被拦截 (400)，实际: %d", respOverOut.StatusCode)
 	}
 
-	// 3.4 修改字典包装规格（从 1盒=12支 改为 1盒=10支），验证历史台账基本数量守恒且包装数重算为 [0.4, 0.4, 0.4]
 	respEditItem, _ := doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/items/%d", baseURL, itemID), adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "base_unit": "支", "pack_unit": "盒", "pack_size": 10, "admin_passcode": "888888",
 	})
@@ -193,7 +183,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	if specRows[1].(map[string]interface{})["pack_qty"].(float64) != 0.4 {
 		t.Fatalf("修改包装规格为10后，4支对应的倒挤包装数应为 0.4，实际: %v", specRows[1].(map[string]interface{})["pack_qty"])
 	}
-	// 改回 1盒=12支 继续后续测试
 	_, _ = doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/items/%d", baseURL, itemID), adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "base_unit": "支", "pack_unit": "盒", "pack_size": 12, "admin_passcode": "888888",
 	})
@@ -201,7 +190,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	// =========================================================================
 	// 模块 4：插入编号、双向无断号重排、日期倒挂标晚日期条目、前后数量、插号负库存回滚
 	// =========================================================================
-	// 4.1 补录早于当前最晚日期(2026-03-20)的单据且未传口令 -> 触发 need_override (409)
 	respNeedOverride, ovRes := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-05", "base_qty": 12, "total_amount": 48,
 	})
@@ -209,7 +197,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("补录前期单据未带口令应返回 409 need_override，实际: %+v", ovRes)
 	}
 
-	// 4.2 在 XH-2026-000002 插入 2026-03-25 单据（日期晚于 000003 的 03-20 -> 触发日期倒挂标在 03-25 这一条上）
 	respInsert, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", adminToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-25", "base_qty": 12, "total_amount": 48,
 		"custom_serial_no": "XH-2026-000002", "admin_passcode": "888888",
@@ -218,7 +205,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("插号补录失败: %d", respInsert.StatusCode)
 	}
 
-	// 4.3 尝试在 XH-2026-000001（最前面）插入一笔领用 5 支（此时尚未入库，会导致时序负库存）-> 必须被拦截并回滚
 	respNegInsert, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", adminToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "OUT", "tx_date": "2026-03-01", "base_qty": 5, "recipient": "测试员",
 		"custom_serial_no": "XH-2026-000001", "admin_passcode": "888888",
@@ -227,7 +213,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("插号导致中间时点负库存必须被拦截并回滚，实际: %d", respNegInsert.StatusCode)
 	}
 
-	// 4.4 验证日期倒挂标记在晚日期条目(03-25)上，且前后结存数量(before_qty / after_qty)准确
 	_, ledgerRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID), adminToken, nil)
 	rows := ledgerRes["data"].([]interface{})
 	if len(rows) != 5 {
@@ -245,7 +230,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("入库前后数量应为 24 -> 36，实际: %v -> %v", r2["before_qty"], r2["after_qty"])
 	}
 
-	// 4.5 修改编号插队：把第 4 条（XH-2026-000004）修改为 XH-2026-000002，验证 000001~000005 绝对连续无断号！
 	fourthID := int64(rows[3].(map[string]interface{})["id"].(float64))
 	respMovePut, _ := doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/consumables/ledger/%d", baseURL, fourthID), adminToken, map[string]interface{}{
 		"serial_no": "XH-2026-000002", "tx_date": "2026-03-20", "base_qty": 4,
@@ -267,7 +251,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	// =========================================================================
 	// 模块 5：在库价值盘点表时间区间恒等式、本期领用包装数、隐藏0结存、采购价格正态分布
 	// =========================================================================
-	// 5.1 截止 2026-03-21 统计（排除 2026-03-25 的 12 支入库），验证 期初(0)+本期入(24)-本期领(12)=期末(12)，本期领用包装=1.0
 	_, invCutRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/inventory?start_date=2026-03-01&end_date=2026-03-21&hide_zero=1", baseURL), adminToken, nil)
 	cutItems := invCutRes["items"].([]interface{})
 	if len(cutItems) != 1 {
@@ -282,7 +265,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("时间区间截断恒等式或本期领用包装数异常: %+v", cutStat)
 	}
 
-	// 5.2 采购价格正态/频率分布分析（有 3.00 元和 4.00 元两批不同单价入库）
 	respDist, distRes := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/items/price-distribution?item_id=%d", baseURL, itemID), adminToken, nil)
 	if respDist.StatusCode != http.StatusOK || distRes["has_data"] != true || distRes["min_price"].(float64) != 3.0 || distRes["max_price"].(float64) != 4.0 {
 		t.Fatalf("采购价格正态分布分析结果异常: %+v", distRes)
@@ -301,7 +283,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	if len(carryListRes["data"].([]interface{})) != 1 {
 		t.Fatalf("结转记录应为 1 条")
 	}
-	// 撤销 2026 年度结转
 	respCancelCarry, _ := doJSONReq(t, http.MethodDelete, baseURL+"/api/carryover?carry_year=2026&admin_passcode=888888", adminToken, nil)
 	if respCancelCarry.StatusCode != http.StatusOK {
 		t.Fatalf("撤销年度结转失败: %d", respCancelCarry.StatusCode)
@@ -313,7 +294,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	var reusableItemID int64
 	_ = db.QueryRow(`SELECT id FROM items WHERE nature = 'reusable' LIMIT 1`).Scan(&reusableItemID)
 
-	// 7.1 入库建档（初始单价填 0，模拟暂未拿到发票）
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("item_id", fmt.Sprintf("%d", reusableItemID))
@@ -330,10 +310,13 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	reqAstIn.Header.Set("Content-Type", mw.FormDataContentType())
 	reqAstIn.Header.Set("X-Auth-Token", entryToken)
 	respAstIn, err := http.DefaultClient.Do(reqAstIn)
-	if err != nil || respAstIn.StatusCode != http.StatusOK {
-		t.Fatalf("复用品入库建档失败: %v", err)
+	if err != nil {
+		t.Fatalf("复用品入库请求失败: %v", err)
 	}
 	_ = respAstIn.Body.Close()
+	if respAstIn.StatusCode != http.StatusOK {
+		t.Fatalf("复用品入库建档失败，状态码: %d", respAstIn.StatusCode)
+	}
 
 	_, assetsRes := doJSONReq(t, http.MethodGet, baseURL+"/api/reusables/assets", adminToken, nil)
 	assetObj := assetsRes["data"].([]interface{})[0].(map[string]interface{})
@@ -342,7 +325,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("预计处置日期应为 2031-05-01，实际: %v", assetObj["disposal_date"])
 	}
 
-	// 7.2 管理员补录修正金额与使用年限
 	var editAstBuf bytes.Buffer
 	emw := multipart.NewWriter(&editAstBuf)
 	_ = emw.WriteField("item_id", fmt.Sprintf("%d", reusableItemID))
@@ -356,14 +338,17 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	reqEditAst, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/api/reusables/assets/%d", baseURL, assetID), &editAstBuf)
 	reqEditAst.Header.Set("Content-Type", emw.FormDataContentType())
 	reqEditAst.Header.Set("X-Auth-Token", adminToken)
-	respEditAst, _ := http.DefaultClient.Do(reqEditAst)
+	respEditAst, err := http.DefaultClient.Do(reqEditAst)
+	if err != nil {
+		t.Fatalf("补录修正复用品请求失败: %v", err)
+	}
 	_ = respEditAst.Body.Close()
 	if respEditAst.StatusCode != http.StatusOK {
 		t.Fatalf("管理员补录修正复用品档案失败: %d", respEditAst.StatusCode)
 	}
 
-	// 7.3 首次领用 -> 重复领用拦截 -> 变更使用人 -> 报废 -> 报废后禁止领用 -> 取消报废
 	postTransition := func(fields map[string]string, withFile bool) int {
+		t.Helper()
 		var b bytes.Buffer
 		w := multipart.NewWriter(&b)
 		for k, v := range fields {
@@ -374,11 +359,17 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 			_, _ = f.Write([]byte("scrap-doc"))
 		}
 		_ = w.Close()
-		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/reusables/assets/%d/transition", baseURL, assetID), &b)
+		req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/reusables/assets/%d/transition", baseURL, assetID), &b)
+		if err != nil {
+			t.Fatalf("构建状态流转请求失败: %v", err)
+		}
 		req.Header.Set("Content-Type", w.FormDataContentType())
 		req.Header.Set("X-Auth-Token", adminToken)
-		r, _ := http.DefaultClient.Do(req)
-		_ = r.Body.Close()
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("执行状态流转请求 (%s) 失败: %v", fields["action"], err)
+		}
+		defer r.Body.Close()
 		return r.StatusCode
 	}
 
@@ -418,7 +409,10 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	reqMaUp, _ := http.NewRequest(http.MethodPost, baseURL+"/api/monthly-attachments", &maBuf)
 	reqMaUp.Header.Set("Content-Type", mmw.FormDataContentType())
 	reqMaUp.Header.Set("X-Auth-Token", entryToken)
-	respMaUp, _ := http.DefaultClient.Do(reqMaUp)
+	respMaUp, err := http.DefaultClient.Do(reqMaUp)
+	if err != nil {
+		t.Fatalf("上传月度附件请求失败: %v", err)
+	}
 	var maUpRes map[string]interface{}
 	_ = json.NewDecoder(respMaUp.Body).Decode(&maUpRes)
 	_ = respMaUp.Body.Close()
@@ -428,7 +422,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	maID := int64(maUpRes["id"].(float64))
 	relFilePath := maUpRes["file_path"].(string)
 
-	// 管理员删除月度附件并验证物理文件同步清理
 	respMaDel, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/monthly-attachments/%d?admin_passcode=888888", baseURL, maID), adminToken, nil)
 	if respMaDel.StatusCode != http.StatusOK {
 		t.Fatalf("管理员删除月度附件失败: %d", respMaDel.StatusCode)
@@ -437,7 +430,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("删除月度附件后物理文件未清理")
 	}
 
-	// 审计日志验证
 	_, auditRes := doJSONReq(t, http.MethodGet, baseURL+"/api/audit-logs", adminToken, nil)
 	if len(auditRes["data"].([]interface{})) < 5 {
 		t.Fatalf("审计日志应记录全部敏感操作")
@@ -447,6 +439,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	// 模块 9：全部 4 种 Excel 导出结构、表头字段与 hide_zero 深度单元格校验
 	// =========================================================================
 	fetchExcel := func(u string) *excelize.File {
+		t.Helper()
 		req, _ := http.NewRequest(http.MethodGet, u, nil)
 		req.Header.Set("X-Auth-Token", adminToken)
 		resp, err := http.DefaultClient.Do(req)
@@ -462,7 +455,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		return xl
 	}
 
-	// 9.1 消耗品盘点表（校验单位、金额单位标注、本期领用(包装数量)列头及 hide_zero=1 生效）
 	xlInv := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_inventory&hide_zero=1", baseURL))
 	defer xlInv.Close()
 	orgCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "A2")
@@ -473,7 +465,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("盘点表 Excel 表头或 hide_zero 过滤校验失败: org=%s, unit=%s, L3=%s, A5=%s", orgCell, unitCell, outPackHeader, row5Seq)
 	}
 
-	// 9.2 消耗品流水账（校验入库/领用前数量、入库领用数量、入库/领用后数量）
 	xlLed := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_ledger", baseURL))
 	defer xlLed.Close()
 	hBefore, _ := xlLed.GetCellValue("消耗品接续流水账", "I3")
@@ -483,7 +474,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("流水账 Excel 列头校验失败: I3=%s, J3=%s, K3=%s", hBefore, hQty, hAfter)
 	}
 
-	// 9.3 复用品台账（校验无实物图列且列对齐）
 	xlAst := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_assets", baseURL))
 	defer xlAst.Close()
 	astHeaders, _ := xlAst.GetRows("复用品类资产台账")
@@ -493,7 +483,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		}
 	}
 
-	// 9.4 单项复用品履历表
 	xlLog := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_single_logs&asset_id=%d", baseURL, assetID))
 	defer xlLog.Close()
 	logRows, _ := xlLog.GetRows("资产全生命周期履历")
