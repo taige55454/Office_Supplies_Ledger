@@ -67,7 +67,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", currentPort)
 
 	// =========================================================================
-	// 模块 1：鉴权、RBAC 角色隔离（登记员只读/录入 vs 管理员全权限）与路径穿越安全
+	// 模块 1：鉴权、RBAC 角色隔离与路径穿越安全
 	// =========================================================================
 	respBadLogin, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/auth/login", "", map[string]string{"passcode": "wrongpass"})
 	if respBadLogin.StatusCode != http.StatusUnauthorized {
@@ -95,6 +95,10 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	if respEntryPut.StatusCode != http.StatusForbidden {
 		t.Fatalf("登记员 PUT 修改必须被拦截 (403)，实际: %d", respEntryPut.StatusCode)
 	}
+	respEntryDel, _ := doJSONReq(t, http.MethodDelete, baseURL+"/api/items/1?admin_passcode=888888", entryToken, nil)
+	if respEntryDel.StatusCode != http.StatusForbidden {
+		t.Fatalf("登记员 DELETE 删除必须被拦截 (403)，实际: %d", respEntryDel.StatusCode)
+	}
 	respEntrySet, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/settings", entryToken, map[string]interface{}{"port": 8099})
 	if respEntrySet.StatusCode != http.StatusForbidden {
 		t.Fatalf("登记员修改设置必须被拦截 (403)，实际: %d", respEntrySet.StatusCode)
@@ -121,7 +125,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 2：基础字典新增、重复拦截、包装规格修改与历史台账数量守恒倒挤
+	// 模块 2：用品库新增、重复拦截、包装规格修改与历史台账数量守恒倒挤、权限删除
 	// =========================================================================
 	respNewItem, createItemRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", entryToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
@@ -132,6 +136,25 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 	itemID := int64(createItemRes["id"].(float64))
 
+	// 2.1 新增一个无业务关联的临时用品，测试管理员口令校验及删除功能
+	_, tempItemRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "误建待删用品", "nature": "consumable",
+		"base_unit": "个", "pack_unit": "盒", "pack_size": 10,
+	})
+	tempItemID := int64(tempItemRes["id"].(float64))
+
+	// 错口令删除拦截
+	respBadDelItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=wrong", baseURL, tempItemID), adminToken, nil)
+	if respBadDelItem.StatusCode != http.StatusForbidden {
+		t.Fatalf("错误口令删除用品库条目必须返回 403，实际: %d", respBadDelItem.StatusCode)
+	}
+	// 正确口令删除成功
+	respOkDelItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, tempItemID), adminToken, nil)
+	if respOkDelItem.StatusCode != http.StatusOK {
+		t.Fatalf("无流水关联用品删除失败: %d", respOkDelItem.StatusCode)
+	}
+
+	// 2.2 同分类同性质同名重复拦截 (409)
 	respDupItem, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
 		"base_unit": "支", "pack_unit": "盒", "pack_size": 12,
@@ -140,6 +163,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("同名用品重复新增必须返回 409，实际: %d", respDupItem.StatusCode)
 	}
 
+	// 2.3 小数基本数量拦截 (400)
 	respDec, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.5, "total_amount": 10,
 	})
@@ -148,11 +172,17 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截
+	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截、有流水关联禁止删除
 	// =========================================================================
 	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 24, "total_amount": 72,
 	})
+
+	// 已有流水记录的用品，即使输入正确管理员口令也必须被引用完整性拦截 (409)
+	respDelUsedItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, itemID), adminToken, nil)
+	if respDelUsedItem.StatusCode != http.StatusConflict {
+		t.Fatalf("已有流水关联的用品必须禁止删除 (409)，实际: %d", respDelUsedItem.StatusCode)
+	}
 
 	var packSteps []float64
 	for i := 1; i <= 3; i++ {
@@ -181,7 +211,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	_, ledgerAfterSpec := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, itemID), adminToken, nil)
 	specRows := ledgerAfterSpec["data"].([]interface{})
 	if specRows[1].(map[string]interface{})["pack_qty"].(float64) != 0.4 {
-		t.Fatalf("修改包装规格为10后，4支对应的倒挤包装数应为 0.4，实际: %v", specRows[1].(map[string]interface{})["pack_qty"])
+		t.Fatalf("修改包装规格为10后，4支对应的折算包装数量应为 0.4，实际: %v", specRows[1].(map[string]interface{})["pack_qty"])
 	}
 	_, _ = doJSONReq(t, http.MethodPut, fmt.Sprintf("%s/api/items/%d", baseURL, itemID), adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "base_unit": "支", "pack_unit": "盒", "pack_size": 12, "admin_passcode": "888888",
@@ -289,7 +319,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 7：复用品（类资产）全生命周期：入库建档 -> 管理员补录修正 -> 领用 -> 变更使用人 -> 报废 -> 取消报废
+	// 模块 7：复用品（类资产）全生命周期
 	// =========================================================================
 	var reusableItemID int64
 	_ = db.QueryRow(`SELECT id FROM items WHERE nature = 'reusable' LIMIT 1`).Scan(&reusableItemID)
@@ -470,8 +500,9 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	hBefore, _ := xlLed.GetCellValue("消耗品接续流水账", "I3")
 	hQty, _ := xlLed.GetCellValue("消耗品接续流水账", "J3")
 	hAfter, _ := xlLed.GetCellValue("消耗品接续流水账", "K3")
-	if hBefore != "入库/领用前数量" || hQty != "入库领用数量" || hAfter != "入库/领用后数量" {
-		t.Fatalf("流水账 Excel 列头校验失败: I3=%s, J3=%s, K3=%s", hBefore, hQty, hAfter)
+	hPack, _ := xlLed.GetCellValue("消耗品接续流水账", "L3")
+	if hBefore != "入库/领用前数量" || hQty != "入库/领用数量" || hAfter != "入库/领用后数量" || hPack != "折算包装数量" {
+		t.Fatalf("流水账 Excel 列头校验失败: I3=%s, J3=%s, K3=%s, L3=%s", hBefore, hQty, hAfter, hPack)
 	}
 
 	xlAst := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_assets", baseURL))
