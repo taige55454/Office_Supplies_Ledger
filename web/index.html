@@ -32,21 +32,21 @@
     </div>
     <div class="topbar-right">
       <span id="role-badge" class="role-badge">检测中...</span>
-      <button class="btn btn-outline" onclick="openDictModal()">📚 用品基础字典</button>
+      <button class="btn btn-outline" onclick="openDictModal()">📚 用品库</button>
       <button id="btn-open-settings" class="btn btn-outline" onclick="openSettingsModal()">⚙️ 系统设置与局域网</button>
     </div>
   </header>
 
   <!-- 主标签页切换 -->
   <nav class="main-tabs no-print">
-    <button class="tab-btn active" data-tab="tab-consumables">📦 消耗品台账与盘点</button>
+    <button class="tab-btn active" data-tab="tab-consumables">📦 消耗品台账与流水</button>
     <button class="tab-btn" data-tab="tab-reusables">🪑 复用品（类资产全生命周期）</button>
     <button class="tab-btn" data-tab="tab-monthly">🗂️ 月度原始手写登记附件</button>
     <button class="tab-btn" data-tab="tab-audit">🛡️ 敏感修改审计日志</button>
   </nav>
 
   <main class="container">
-    <!-- ==================== TAB 1: 消耗品台账与盘点 ==================== -->
+    <!-- ==================== TAB 1: 消耗品台账与流水 ==================== -->
     <section id="tab-consumables" class="tab-panel active">
       <div class="action-bar no-print">
         <div class="action-group">
@@ -95,7 +95,7 @@
       <!-- 分类汇总卡片 -->
       <div id="consumable-cat-cards" class="summary-cards"></div>
 
-      <!-- 盘点统计表（补齐本期领用包装数量） -->
+      <!-- 盘点统计表 -->
       <div class="card">
         <div class="card-header">
           <h3>📊 消耗品期初 / 期末盘点与移动加权在库价值表</h3>
@@ -156,9 +156,9 @@
                 <th>包装规格</th>
                 <th>类型</th>
                 <th class="col-qty">入库/领用<br/>前数量</th>
-                <th class="col-qty">入库领用<br/>数量</th>
+                <th class="col-qty">入库/领用<br/>数量</th>
                 <th class="col-qty">入库/领用<br/>后数量</th>
-                <th class="col-qty">倒挤<br/>包装数</th>
+                <th class="col-qty">折算<br/>包装数量</th>
                 <th class="col-money">采购/领用<br/>金额</th>
                 <th class="col-money">单价</th>
                 <th>领用人</th>
@@ -277,7 +277,7 @@
     <section id="tab-audit" class="tab-panel">
       <div class="card">
         <div class="card-header">
-          <h3>🛡️ 管理员特权修改、取消报废、插号与结转审计追踪</h3>
+          <h3>🛡️ 管理员特权修改、删除、取消报废、插号与结转审计追踪</h3>
           <button class="btn btn-sm btn-outline" onclick="loadAuditLogs()">🔄 刷新日志</button>
         </div>
         <div class="table-responsive table-scroll-box-lg">
@@ -297,16 +297,16 @@
     </section>
   </main>
 
-  <!-- ==================== 弹窗 0: 用品基础字典抽屉弹窗 ==================== -->
+  <!-- ==================== 弹窗 0: 用品库管理抽屉弹窗 ==================== -->
   <div id="modal-dict" class="modal hidden">
-    <div class="modal-box" style="max-width:960px;">
+    <div class="modal-box" style="max-width:980px;">
       <div class="modal-header">
-        <h3>📚 用品基础字典管理（防重复 + 修改数量守恒折算）</h3>
+        <h3>📚 用品库管理（防重复 + 修改数量守恒折算 + 权限删除）</h3>
         <button class="close-btn" onclick="closeModal('modal-dict')">×</button>
       </div>
       <div class="modal-body">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px;">
-          <button class="btn btn-success" onclick="openNewItemModal()">➕ 新增基础用品字典</button>
+          <button class="btn btn-success" onclick="openNewItemModal()">➕ 新增用品库条目</button>
           <div style="display:flex;gap:10px;">
             <select id="dict-nature" class="form-control" style="width:160px;" onchange="renderDictTable()">
               <option value="">全部性质</option>
@@ -364,7 +364,7 @@
             <input type="date" id="tx-date" class="form-control" />
           </div>
           <div class="form-group">
-            <label id="tx-base-label">入库领用数量（必须为正整数） *</label>
+            <label id="tx-base-label">入库/领用数量（必须为正整数） *</label>
             <input type="number" id="tx-base-qty" class="form-control" step="1" min="1" placeholder="输入整数或通过包装数自动算" oninput="onBaseQtyInput()" />
           </div>
           <div class="form-group">
@@ -432,7 +432,7 @@
             <input type="date" id="edit-ledger-date" class="form-control" />
           </div>
           <div class="form-group">
-            <label>入库领用数量（正整数） *</label>
+            <label>入库/领用数量（正整数） *</label>
             <input type="number" id="edit-ledger-qty" class="form-control" step="1" min="1" oninput="onEditBaseQtyInput()" />
           </div>
           <div class="form-group">
@@ -464,11 +464,11 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 3: 新增基础用品 ==================== -->
+  <!-- ==================== 弹窗 3: 新增用品库条目 ==================== -->
   <div id="modal-new-item" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>➕ 新增基础用品字典</h3>
+        <h3>➕ 新增用品库条目</h3>
         <button class="close-btn" onclick="closeModal('modal-new-item')">×</button>
       </div>
       <div class="modal-body">
@@ -510,16 +510,16 @@
     </div>
   </div>
 
-  <!-- ==================== 弹窗 4: 修改基础用品字典 ==================== -->
+  <!-- ==================== 弹窗 4: 修改用品库信息 ==================== -->
   <div id="modal-edit-item" class="modal hidden">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>✏️ 修改基础用品信息（数量守恒折算）</h3>
+        <h3>✏️ 修改用品库信息（数量守恒折算）</h3>
         <button class="close-btn" onclick="closeModal('modal-edit-item')">×</button>
       </div>
       <div class="modal-body">
         <input type="hidden" id="edit-item-id" />
-        <div class="warn-banner">⚠️ 提示：修改包装换算规格后，历史台账中的【基本数量】保持绝对不变，【包装数量】将自动按新规格重新倒挤折算！</div>
+        <div class="warn-banner">⚠️ 提示：修改包装换算规格后，历史台账中的【基本数量】保持绝对不变，【折算包装数量】将自动按新规格重新计算！</div>
         <div class="form-grid">
           <div class="form-group">
             <label>用品分类 *</label>
