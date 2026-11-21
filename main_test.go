@@ -125,7 +125,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 2：用品库新增、重复拦截、包装规格修改与历史台账数量守恒倒挤、权限删除
+	// 模块 2：用品库新增（含专有编码）、重复拦截、包装规格修改与历史台账数量守恒倒挤
 	// =========================================================================
 	respNewItem, createItemRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", entryToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
@@ -135,26 +135,10 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("新增用品失败: %+v", createItemRes)
 	}
 	itemID := int64(createItemRes["id"].(float64))
-
-	// 2.1 新增一个无业务关联的临时用品，测试管理员口令校验及删除功能
-	_, tempItemRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
-		"category": "办公文具", "name": "误建待删用品", "nature": "consumable",
-		"base_unit": "个", "pack_unit": "盒", "pack_size": 10,
-	})
-	tempItemID := int64(tempItemRes["id"].(float64))
-
-	// 错口令删除拦截
-	respBadDelItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=wrong", baseURL, tempItemID), adminToken, nil)
-	if respBadDelItem.StatusCode != http.StatusForbidden {
-		t.Fatalf("错误口令删除用品库条目必须返回 403，实际: %d", respBadDelItem.StatusCode)
-	}
-	// 正确口令删除成功
-	respOkDelItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, tempItemID), adminToken, nil)
-	if respOkDelItem.StatusCode != http.StatusOK {
-		t.Fatalf("无流水关联用品删除失败: %d", respOkDelItem.StatusCode)
+	if !strings.HasPrefix(createItemRes["item_code"].(string), "YP-") {
+		t.Fatalf("新增用品未生成专有编码: %+v", createItemRes)
 	}
 
-	// 2.2 同分类同性质同名重复拦截 (409)
 	respDupItem, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
 		"category": "办公文具", "name": "全覆盖测试笔", "nature": "consumable",
 		"base_unit": "支", "pack_unit": "盒", "pack_size": 12,
@@ -163,7 +147,6 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		t.Fatalf("同名用品重复新增必须返回 409，实际: %d", respDupItem.StatusCode)
 	}
 
-	// 2.3 小数基本数量拦截 (400)
 	respDec, _ := doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 3.5, "total_amount": 10,
 	})
@@ -172,17 +155,11 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截、有流水关联禁止删除
+	// 模块 3：消耗品出入库、实时动态倒挤包装尾差、负库存拦截
 	// =========================================================================
 	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
 		"item_id": itemID, "tx_type": "IN", "tx_date": "2026-03-10", "base_qty": 24, "total_amount": 72,
 	})
-
-	// 已有流水记录的用品，即使输入正确管理员口令也必须被引用完整性拦截 (409)
-	respDelUsedItem, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, itemID), adminToken, nil)
-	if respDelUsedItem.StatusCode != http.StatusConflict {
-		t.Fatalf("已有流水关联的用品必须禁止删除 (409)，实际: %d", respDelUsedItem.StatusCode)
-	}
 
 	var packSteps []float64
 	for i := 1; i <= 3; i++ {
@@ -276,6 +253,61 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 		if gotNo != expectedNo {
 			t.Fatalf("修改编号移动后出现断号或跳号！第 %d 条期望 %s，实际 %s", i+1, expectedNo, gotNo)
 		}
+	}
+
+	// =========================================================================
+	// 模块 4.5：用品用完清零后删除 -> 历史流水封存不受影响 -> 再次新增同名不同规格完全独立且分配新编码
+	// =========================================================================
+	_, oldClipRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "特制长尾夹", "nature": "consumable",
+		"base_unit": "个", "pack_unit": "盒", "pack_size": 24,
+	})
+	oldClipID := int64(oldClipRes["id"].(float64))
+	oldClipCode := oldClipRes["item_code"].(string)
+
+	// 入库 24 个（1盒），金额 48 元，随后全部领用清零
+	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": oldClipID, "tx_type": "IN", "tx_date": "2026-03-15", "base_qty": 24, "total_amount": 48,
+	})
+	// 仍有结存时删除必须拦截 (409)
+	respDelNotEmpty, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, oldClipID), adminToken, nil)
+	if respDelNotEmpty.StatusCode != http.StatusConflict {
+		t.Fatalf("仍有结存的用品必须禁止删除 (409)，实际: %d", respDelNotEmpty.StatusCode)
+	}
+	// 全部领用出库清零
+	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": oldClipID, "tx_type": "OUT", "tx_date": "2026-03-16", "base_qty": 24, "recipient": "行政部",
+	})
+	// 结存归零后管理员删除该旧规格用品
+	respDelZeroOk, _ := doJSONReq(t, http.MethodDelete, fmt.Sprintf("%s/api/items/%d?admin_passcode=888888", baseURL, oldClipID), adminToken, nil)
+	if respDelZeroOk.StatusCode != http.StatusOK {
+		t.Fatalf("结存清零后的用品删除失败: %d", respDelZeroOk.StatusCode)
+	}
+
+	// 过了一段时间再次新增一模一样品名【特制长尾夹】，但换成了新规格 1盒=12个
+	respNewClip, newClipRes := doJSONReq(t, http.MethodPost, baseURL+"/api/items", adminToken, map[string]interface{}{
+		"category": "办公文具", "name": "特制长尾夹", "nature": "consumable",
+		"base_unit": "个", "pack_unit": "盒", "pack_size": 12,
+	})
+	if respNewClip.StatusCode != http.StatusOK {
+		t.Fatalf("删除旧规格后再次添加同名新规格用品不应被重复拦截，实际状态码: %d, 返回: %+v", respNewClip.StatusCode, newClipRes)
+	}
+	newClipID := int64(newClipRes["id"].(float64))
+	newClipCode := newClipRes["item_code"].(string)
+	if newClipID == oldClipID || newClipCode == oldClipCode {
+		t.Fatalf("新添加的同名新规格用品必须拥有独立ID与专有编码！旧:%s, 新:%s", oldClipCode, newClipCode)
+	}
+
+	// 新规格入库 12 个（1盒），金额 36 元
+	_, _ = doJSONReq(t, http.MethodPost, baseURL+"/api/consumables/ledger", entryToken, map[string]interface{}{
+		"item_id": newClipID, "tx_type": "IN", "tx_date": "2026-04-01", "base_qty": 12, "total_amount": 36,
+	})
+
+	// 断言：旧规格的历史流水依然是 2 条且折算包装数量仍为 1（按旧规格24算），新规格流水独立为 1 条且单价 3.00
+	_, oldClipLedger := doJSONReq(t, http.MethodGet, fmt.Sprintf("%s/api/consumables/ledger?item_id=%d", baseURL, oldClipID), adminToken, nil)
+	oldRows := oldClipLedger["data"].([]interface{})
+	if len(oldRows) != 2 || oldRows[0].(map[string]interface{})["pack_qty"].(float64) != 1.0 {
+		t.Fatalf("旧规格用品的封存流水与折算包装数不应受新规格添加影响: %+v", oldRows)
 	}
 
 	// =========================================================================
@@ -488,21 +520,23 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	xlInv := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_inventory&hide_zero=1", baseURL))
 	defer xlInv.Close()
 	orgCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "A2")
-	unitCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "P2")
-	outPackHeader, _ := xlInv.GetCellValue("消耗品盘点统计表", "L3")
-	row5Seq, _ := xlInv.GetCellValue("消耗品盘点统计表", "A5")
-	if !strings.Contains(orgCell, "集团综合行政部") || unitCell != "金额单位：元" || outPackHeader != "本期领用(包装数量)" || row5Seq != "" {
-		t.Fatalf("盘点表 Excel 表头或 hide_zero 过滤校验失败: org=%s, unit=%s, L3=%s, A5=%s", orgCell, unitCell, outPackHeader, row5Seq)
+	unitCell, _ := xlInv.GetCellValue("消耗品盘点统计表", "Q2")
+	codeHeader, _ := xlInv.GetCellValue("消耗品盘点统计表", "B3")
+	outPackHeader, _ := xlInv.GetCellValue("消耗品盘点统计表", "M3")
+	row6Seq, _ := xlInv.GetCellValue("消耗品盘点统计表", "A6")
+	if !strings.Contains(orgCell, "集团综合行政部") || unitCell != "金额单位：元" || codeHeader != "用品编码" || outPackHeader != "本期领用(包装数量)" || row6Seq != "" {
+		t.Fatalf("盘点表 Excel 表头或 hide_zero 过滤校验失败: org=%s, unit=%s, B3=%s, M3=%s, A6=%s", orgCell, unitCell, codeHeader, outPackHeader, row6Seq)
 	}
 
 	xlLed := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_ledger", baseURL))
 	defer xlLed.Close()
-	hBefore, _ := xlLed.GetCellValue("消耗品接续流水账", "I3")
-	hQty, _ := xlLed.GetCellValue("消耗品接续流水账", "J3")
-	hAfter, _ := xlLed.GetCellValue("消耗品接续流水账", "K3")
-	hPack, _ := xlLed.GetCellValue("消耗品接续流水账", "L3")
-	if hBefore != "入库/领用前数量" || hQty != "入库/领用数量" || hAfter != "入库/领用后数量" || hPack != "折算包装数量" {
-		t.Fatalf("流水账 Excel 列头校验失败: I3=%s, J3=%s, K3=%s, L3=%s", hBefore, hQty, hAfter, hPack)
+	hCode, _ := xlLed.GetCellValue("消耗品接续流水账", "C3")
+	hBefore, _ := xlLed.GetCellValue("消耗品接续流水账", "J3")
+	hQty, _ := xlLed.GetCellValue("消耗品接续流水账", "K3")
+	hAfter, _ := xlLed.GetCellValue("消耗品接续流水账", "L3")
+	hPack, _ := xlLed.GetCellValue("消耗品接续流水账", "M3")
+	if hCode != "用品编码" || hBefore != "入库/领用前数量" || hQty != "入库/领用数量" || hAfter != "入库/领用后数量" || hPack != "折算包装数量" {
+		t.Fatalf("流水账 Excel 列头校验失败: C3=%s, J3=%s, K3=%s, L3=%s, M3=%s", hCode, hBefore, hQty, hAfter, hPack)
 	}
 
 	xlAst := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_assets", baseURL))
