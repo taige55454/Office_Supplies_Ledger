@@ -142,7 +142,9 @@ func initDatabase() error {
 	if err != nil {
 		return err
 	}
-	db.SetMaxOpenConns(1) // SQLite 单写连接避免并发锁冲突
+	// WAL 模式下允许并发读，配合 busy_timeout(5000) 彻底避免单连接自死锁
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS items (
@@ -337,7 +339,6 @@ func recordRecipient(name string) {
 		return
 	}
 	_, _ = db.Exec(`INSERT INTO recipients (name, last_used_at) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET last_used_at = excluded.last_used_at`, clean, nowStr())
-	// 仅保留最新 10 条不重复领用人
 	_, _ = db.Exec(`DELETE FROM recipients WHERE id NOT IN (SELECT id FROM recipients ORDER BY last_used_at DESC LIMIT 10)`)
 }
 
@@ -437,7 +438,6 @@ func authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 若为“内网录入员 (entry)”，严格禁止所有修改(PUT)、删除(DELETE)、年度结转及系统设置操作
 		if role == "entry" {
 			if r.Method == http.MethodPut || r.Method == http.MethodDelete ||
 				strings.HasPrefix(path, "/api/settings") ||
@@ -497,13 +497,13 @@ func handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"success":      true,
-		"is_localhost": isLocal,
-		"role":         role,
+		"success":       true,
+		"is_localhost":  isLocal,
+		"role":          role,
 		"authenticated": role == "admin" || role == "entry",
-		"port":         port,
-		"lan_urls":     urls,
-		"allow_lan":    cfgCopy.AllowLan,
+		"port":          port,
+		"lan_urls":      urls,
+		"allow_lan":     cfgCopy.AllowLan,
 	}
 	if isLocal {
 		resp["admin_passcode"] = cfgCopy.AdminPasscode
@@ -660,7 +660,6 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
-		defer rows.Close()
 
 		list := make([]ItemDTO, 0)
 		for rows.Next() {
@@ -668,13 +667,19 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 			if err := rows.Scan(&it.ID, &it.Category, &it.Name, &it.Nature, &it.BaseUnit, &it.PackUnit, &it.PackSize, &it.MinPrice, &it.MaxPrice, &it.CreatedAt); err != nil {
 				continue
 			}
-			if it.Nature == "consumable" {
-				it.StockQty = calcConsumableStockAtDate(it.ID, "9999-12-31", true)
-			} else {
-				_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE item_id = ? AND status != '报废'`, it.ID).Scan(&it.AssetCnt)
-			}
 			list = append(list, it)
 		}
+		rows.Close()
+
+		// 释放外层游标后再填充实时库存/在用件数
+		for idx := range list {
+			if list[idx].Nature == "consumable" {
+				list[idx].StockQty = calcConsumableStockAtDate(list[idx].ID, "9999-12-31", true)
+			} else {
+				_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE item_id = ? AND status != '报废'`, list[idx].ID).Scan(&list[idx].AssetCnt)
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 
 	case http.MethodPost:
@@ -777,7 +782,6 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		req.PackSize = 1
 	}
 
-	// 检查修改后是否与其他同分类同性质用品重名
 	var dup int
 	_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ? AND id != ?`, req.Category, nature, req.Name, itemID).Scan(&dup)
 	if dup > 0 {
@@ -799,7 +803,6 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 核心规则：已登记流水以【基本数量】为准，包装数量按新的 pack_size 自动重新折算！
 	_, err = tx.Exec(`UPDATE consumable_ledger SET pack_qty = ROUND(base_qty / ?, 4), updated_at = ? WHERE item_id = ?`, req.PackSize, nowStr(), itemID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
@@ -1078,7 +1081,6 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		packSize = 1
 	}
 
-	// 库存防负数校验
 	curTotalStock := calcConsumableStockAtDate(itemID, "9999-12-31", true)
 	var simulatedStock float64
 	if txType == "IN" {
@@ -1116,9 +1118,7 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 
 // ==================== 8. 会计级期初/期末盘点统计与年度结转引擎 ====================
 
-// 计算指定日期（含当日或不含当日）的消耗品库存结存
 func calcConsumableStockAtDate(itemID int64, targetDate string, inclusive bool) float64 {
-	// 1. 查找目标日期之前最近的一次年度结转点
 	var carryYear int
 	var carryQty float64
 	err := db.QueryRow(`SELECT carry_year, closing_base_qty FROM annual_carryover WHERE item_id = ? AND (carry_year || '-12-31') < ? ORDER BY carry_year DESC LIMIT 1`,
@@ -1146,6 +1146,17 @@ func calcConsumableStockAtDate(itemID int64, targetDate string, inclusive bool) 
 	_ = db.QueryRow(q, itemID, startBoundary, targetDate).Scan(&inSum, &outSum)
 
 	return round4(baseStock + inSum - outSum)
+}
+
+type consumableBaseInfo struct {
+	ID       int64
+	Category string
+	Name     string
+	BaseUnit string
+	PackUnit string
+	PackSize float64
+	MinPrice float64
+	MaxPrice float64
 }
 
 func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
@@ -1178,20 +1189,21 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
 	}
-	defer rows.Close()
 
-	itemsList := make([]map[string]interface{}, 0)
+	var baseList []consumableBaseInfo
+	for rows.Next() {
+		var b consumableBaseInfo
+		if err := rows.Scan(&b.ID, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice); err == nil {
+			baseList = append(baseList, b)
+		}
+	}
+	rows.Close()
+
+	itemsList := make([]map[string]interface{}, 0, len(baseList))
 	catSummaryMap := make(map[string]map[string]interface{})
 
-	for rows.Next() {
-		var id int64
-		var cat, name, bUnit, pUnit string
-		var pSize, minP, maxP float64
-		if err := rows.Scan(&id, &cat, &name, &bUnit, &pUnit, &pSize, &minP, &maxP); err != nil {
-			continue
-		}
-
-		openingQty := calcConsumableStockAtDate(id, startDate, false)
+	for _, b := range baseList {
+		openingQty := calcConsumableStockAtDate(b.ID, startDate, false)
 		var periodInQty, periodOutQty, periodInAmt float64
 		_ = db.QueryRow(`
 			SELECT
@@ -1199,42 +1211,42 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 				COALESCE(SUM(CASE WHEN tx_type = 'OUT' THEN base_qty ELSE 0 END), 0),
 				COALESCE(SUM(CASE WHEN tx_type = 'IN' THEN total_amount ELSE 0 END), 0)
 			FROM consumable_ledger
-			WHERE item_id = ? AND tx_date >= ? AND tx_date <= ?`, id, startDate, endDate).Scan(&periodInQty, &periodOutQty, &periodInAmt)
+			WHERE item_id = ? AND tx_date >= ? AND tx_date <= ?`, b.ID, startDate, endDate).Scan(&periodInQty, &periodOutQty, &periodInAmt)
 
 		closingQty := round4(openingQty + periodInQty - periodOutQty)
 
 		rowObj := map[string]interface{}{
-			"item_id":          id,
-			"category":         cat,
-			"item_name":        name,
-			"base_unit":        bUnit,
-			"pack_unit":        pUnit,
-			"pack_size":        pSize,
+			"item_id":          b.ID,
+			"category":         b.Category,
+			"item_name":        b.Name,
+			"base_unit":        b.BaseUnit,
+			"pack_unit":        b.PackUnit,
+			"pack_size":        b.PackSize,
 			"opening_base_qty": openingQty,
-			"opening_pack_qty": round4(openingQty / pSize),
+			"opening_pack_qty": round4(openingQty / b.PackSize),
 			"in_base_qty":      round4(periodInQty),
-			"in_pack_qty":      round4(periodInQty / pSize),
+			"in_pack_qty":      round4(periodInQty / b.PackSize),
 			"out_base_qty":     round4(periodOutQty),
-			"out_pack_qty":     round4(periodOutQty / pSize),
+			"out_pack_qty":     round4(periodOutQty / b.PackSize),
 			"closing_base_qty": closingQty,
-			"closing_pack_qty": round4(closingQty / pSize),
+			"closing_pack_qty": round4(closingQty / b.PackSize),
 			"period_in_amount": round2(periodInAmt),
-			"price_range":      formatPriceRange(minP, maxP),
+			"price_range":      formatPriceRange(b.MinPrice, b.MaxPrice),
 		}
 		itemsList = append(itemsList, rowObj)
 
-		if _, ok := catSummaryMap[cat]; !ok {
-			catSummaryMap[cat] = map[string]interface{}{
-				"category":       cat,
-				"item_count":     0,
-				"total_in_amt":   0.0,
-				"active_skus":    0,
+		if _, ok := catSummaryMap[b.Category]; !ok {
+			catSummaryMap[b.Category] = map[string]interface{}{
+				"category":     b.Category,
+				"item_count":   0,
+				"total_in_amt": 0.0,
+				"active_skus":  0,
 			}
 		}
-		catSummaryMap[cat]["item_count"] = catSummaryMap[cat]["item_count"].(int) + 1
-		catSummaryMap[cat]["total_in_amt"] = round2(catSummaryMap[cat]["total_in_amt"].(float64) + periodInAmt)
+		catSummaryMap[b.Category]["item_count"] = catSummaryMap[b.Category]["item_count"].(int) + 1
+		catSummaryMap[b.Category]["total_in_amt"] = round2(catSummaryMap[b.Category]["total_in_amt"].(float64) + periodInAmt)
 		if closingQty > 0 {
-			catSummaryMap[cat]["active_skus"] = catSummaryMap[cat]["active_skus"].(int) + 1
+			catSummaryMap[b.Category]["active_skus"] = catSummaryMap[b.Category]["active_skus"].(int) + 1
 		}
 	}
 
@@ -1303,7 +1315,6 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 结转前自动备份数据库
 	autoDailyBackup()
 
 	yearEndDate := fmt.Sprintf("%d-12-31", req.CarryYear)
@@ -1320,6 +1331,12 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 	}
 	rows.Close()
 
+	// 在开启写事务之前先完成所有消耗品的期末结存计算
+	closingMap := make(map[int64]float64, len(itemIDs))
+	for _, itID := range itemIDs {
+		closingMap[itID] = calcConsumableStockAtDate(itID, yearEndDate, true)
+	}
+
 	now := nowStr()
 	tx, err := db.Begin()
 	if err != nil {
@@ -1329,12 +1346,11 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	for _, itID := range itemIDs {
-		closingQty := calcConsumableStockAtDate(itID, yearEndDate, true)
 		_, err := tx.Exec(`
 			INSERT INTO annual_carryover (carry_year, item_id, closing_base_qty, created_at)
 			VALUES (?, ?, ?, ?)
 			ON CONFLICT(carry_year, item_id) DO UPDATE SET closing_base_qty = excluded.closing_base_qty, created_at = excluded.created_at`,
-			req.CarryYear, itID, closingQty, now)
+			req.CarryYear, itID, closingMap[itID], now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
@@ -1346,7 +1362,6 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 统计复用品当前在用与报废数量作为年度结转摘要
 	var inUseCnt, idleCnt, scrapCnt int
 	_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE status = '在用'`).Scan(&inUseCnt)
 	_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE status = '闲置'`).Scan(&idleCnt)
@@ -1516,7 +1531,6 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 		})
 
 	case http.MethodPost:
-		// 复用品入库登记（multipart/form-data，强制要求上传对应图片附件）
 		if err := r.ParseMultipartForm(30 << 20); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "表单解析失败"})
 			return
@@ -1529,7 +1543,7 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 		totalAmt, _ := strconv.ParseFloat(r.FormValue("total_amount"), 64)
 		expectedYears, _ := strconv.Atoi(r.FormValue("expected_years"))
 		if expectedYears <= 0 {
-			expectedYears = 10 // 默认 10 年
+			expectedYears = 10
 		}
 		purchaseDate := strings.TrimSpace(r.FormValue("purchase_date"))
 		if purchaseDate == "" {
@@ -1623,7 +1637,6 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 复用品全生命周期流转：领用分配 / 变更使用人 / 报废登记（含报废凭证上传）/ 信息修正
 func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.TrimPrefix(r.URL.Path, "/api/reusables/assets/")
 	parts := strings.Split(trimmed, "/")
@@ -1656,7 +1669,7 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 2 && parts[1] == "transition" && r.Method == http.MethodPost {
 		_ = r.ParseMultipartForm(20 << 20)
-		action := r.FormValue("action") // ASSIGN(领用), TRANSFER(变更使用人), SCRAP(报废)
+		action := r.FormValue("action")
 		actionDate := strings.TrimSpace(r.FormValue("action_date"))
 		if actionDate == "" {
 			actionDate = todayStr()
@@ -1953,7 +1966,7 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 // ==================== 11. Excel 专业盘点与流水账导出 ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
-	mode := r.URL.Query().Get("mode") // consumable_inventory | consumable_ledger | reusable_assets
+	mode := r.URL.Query().Get("mode")
 	startDate := r.URL.Query().Get("start_date")
 	endDate := r.URL.Query().Get("end_date")
 	if startDate == "" {
@@ -2068,28 +2081,32 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
 		rows, _ := db.Query(`SELECT id, category, name, base_unit, pack_unit, pack_size, min_price, max_price FROM items WHERE nature = 'consumable' ORDER BY category ASC, id ASC`)
-		rIdx := 2
+		var baseList []consumableBaseInfo
 		if rows != nil {
-			defer rows.Close()
 			for rows.Next() {
-				var id int64
-				var cat, name, bUnit, pUnit string
-				var pSize, minP, maxP float64
-				_ = rows.Scan(&id, &cat, &name, &bUnit, &pUnit, &pSize, &minP, &maxP)
-				openQty := calcConsumableStockAtDate(id, startDate, false)
-				var inQty, outQty, inAmt float64
-				_ = db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN tx_type='IN' THEN base_qty ELSE 0 END),0), COALESCE(SUM(CASE WHEN tx_type='OUT' THEN base_qty ELSE 0 END),0), COALESCE(SUM(CASE WHEN tx_type='IN' THEN total_amount ELSE 0 END),0) FROM consumable_ledger WHERE item_id=? AND tx_date>=? AND tx_date<=?`,
-					id, startDate, endDate).Scan(&inQty, &outQty, &inAmt)
-				closeQty := round4(openQty + inQty - outQty)
-				spec := fmt.Sprintf("1%s = %g%s", pUnit, pSize, bUnit)
-				vals := []interface{}{cat, name, bUnit, spec, openQty, round4(openQty / pSize), inQty, outQty, closeQty, round4(closeQty / pSize), inAmt, formatPriceRange(minP, maxP)}
-				for cIdx, v := range vals {
-					cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
-					_ = f.SetCellValue(sheet, cell, v)
-					_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+				var b consumableBaseInfo
+				if err := rows.Scan(&b.ID, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice); err == nil {
+					baseList = append(baseList, b)
 				}
-				rIdx++
 			}
+			rows.Close()
+		}
+
+		rIdx := 2
+		for _, b := range baseList {
+			openQty := calcConsumableStockAtDate(b.ID, startDate, false)
+			var inQty, outQty, inAmt float64
+			_ = db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN tx_type='IN' THEN base_qty ELSE 0 END),0), COALESCE(SUM(CASE WHEN tx_type='OUT' THEN base_qty ELSE 0 END),0), COALESCE(SUM(CASE WHEN tx_type='IN' THEN total_amount ELSE 0 END),0) FROM consumable_ledger WHERE item_id=? AND tx_date>=? AND tx_date<=?`,
+				b.ID, startDate, endDate).Scan(&inQty, &outQty, &inAmt)
+			closeQty := round4(openQty + inQty - outQty)
+			spec := fmt.Sprintf("1%s = %g%s", b.PackUnit, b.PackSize, b.BaseUnit)
+			vals := []interface{}{b.Category, b.Name, b.BaseUnit, spec, openQty, round4(openQty / b.PackSize), inQty, outQty, closeQty, round4(closeQty / b.PackSize), inAmt, formatPriceRange(b.MinPrice, b.MaxPrice)}
+			for cIdx, v := range vals {
+				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
+				_ = f.SetCellValue(sheet, cell, v)
+				_ = f.SetCellStyle(sheet, cell, cell, cellStyle)
+			}
+			rIdx++
 		}
 		fileName = fmt.Sprintf("消耗品盘点统计表_%s至%s.xlsx", startDate, endDate)
 	}
@@ -2127,7 +2144,6 @@ func buildHTTPMux() http.Handler {
 	mux.HandleFunc("/api/audit-logs", handleAuditLogs)
 	mux.HandleFunc("/api/export/excel", handleExportExcel)
 
-	// 静态附件安全访问（防目录穿越）
 	mux.HandleFunc("/attachments/", func(w http.ResponseWriter, r *http.Request) {
 		rel := strings.TrimPrefix(r.URL.Path, "/attachments/")
 		cleanRel := filepath.Clean(filepath.FromSlash(rel))
@@ -2142,7 +2158,6 @@ func buildHTTPMux() http.Handler {
 		http.ServeFile(w, r, absPath)
 	})
 
-	// 内嵌静态网页
 	subWeb, _ := fs.Sub(embeddedWebFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(subWeb)))
 
