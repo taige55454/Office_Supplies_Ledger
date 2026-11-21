@@ -265,7 +265,6 @@ func initDatabase() error {
 		return err
 	}
 
-	// 兼容旧数据库升级补列
 	_, _ = db.Exec(`ALTER TABLE annual_carryover ADD COLUMN closing_value REAL NOT NULL DEFAULT 0`)
 
 	seedDefaultItems()
@@ -312,7 +311,7 @@ func autoDailyBackup() {
 	_, _ = db.Exec(fmt.Sprintf(`VACUUM INTO '%s'`, strings.ReplaceAll(dest, "'", "''")))
 }
 
-// ==================== 3. 通用工具函数与移动加权成本核算引擎 ====================
+// ==================== 3. 通用工具函数、动态包装倒挤与移动加权成本核算引擎 ====================
 
 func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
@@ -363,6 +362,64 @@ func recordRecipient(name string) {
 	_, _ = db.Exec(`DELETE FROM recipients WHERE id NOT IN (SELECT id FROM recipients ORDER BY last_used_at DESC LIMIT 10)`)
 }
 
+// 每次登记、修正或修改包装规格时，实时对该品种全量流水执行【累计包装进度差额倒挤】并持久化
+// 示例（1盒=12支）：分3次每次领4支 -> 第1次 0.33盒、第2次 0.34盒、第3次 0.33盒，三笔求和精确等于 1.00盒，彻底消除持续循环补领过程中的包装尾差！
+func reconcileItemPackQuantities(itemID int64) {
+	var packSize int64
+	if err := db.QueryRow(`SELECT pack_size FROM items WHERE id = ?`, itemID).Scan(&packSize); err != nil {
+		return
+	}
+	if packSize <= 0 {
+		packSize = 1
+	}
+
+	rows, err := db.Query(`
+		SELECT id, tx_type, base_qty, pack_qty
+		FROM consumable_ledger
+		WHERE item_id = ?
+		ORDER BY tx_date ASC, ledger_year ASC, seq_num ASC, id ASC`, itemID)
+	if err != nil {
+		return
+	}
+
+	type ledgerRec struct {
+		id      int64
+		txType  string
+		baseQty int64
+		oldPack float64
+		newPack float64
+	}
+	var records []ledgerRec
+	var cumInBase, cumOutBase int64
+	var cumInPack, cumOutPack float64
+
+	for rows.Next() {
+		var r ledgerRec
+		if err := rows.Scan(&r.id, &r.txType, &r.baseQty, &r.oldPack); err != nil {
+			continue
+		}
+		if r.txType == "IN" {
+			cumInBase += r.baseQty
+			targetPack := round2(float64(cumInBase) / float64(packSize))
+			r.newPack = round2(targetPack - cumInPack)
+			cumInPack = targetPack
+		} else {
+			cumOutBase += r.baseQty
+			targetPack := round2(float64(cumOutBase) / float64(packSize))
+			r.newPack = round2(targetPack - cumOutPack)
+			cumOutPack = targetPack
+		}
+		records = append(records, r)
+	}
+	rows.Close()
+
+	for _, r := range records {
+		if math.Abs(r.oldPack-r.newPack) > 0.0001 {
+			_, _ = db.Exec(`UPDATE consumable_ledger SET pack_qty = ? WHERE id = ?`, r.newPack, r.id)
+		}
+	}
+}
+
 // 移动加权平均成本全周期重算引擎：精确计算任意单据的出库成本与任意时点的在库数量/在库余值
 type movingAvgSnapshot struct {
 	StockQty        int64
@@ -402,14 +459,12 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 			continue
 		}
 
-		// 进入查询区间前快照期初库存与期初在库价值
 		if !openingCaptured && startDate != "" && tDate >= startDate {
 			snap.OpeningQty = curQty
 			snap.OpeningValue = round2(curVal)
 			openingCaptured = true
 		}
 
-		// 超出截止日期则停止推进期末余额
 		if endDate != "" && tDate > endDate {
 			break
 		}
@@ -428,7 +483,6 @@ func replayConsumableMovingAvg(itemID int64, startDate, endDate string) (movingA
 			if curQty <= 0 {
 				outCost = 0
 			} else if qty >= curQty {
-				// 全部领完时自动倒挤清零剩余在库价值，防止除法尾差残留
 				outCost = round2(curVal)
 				curQty = 0
 				curVal = 0
@@ -733,7 +787,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ==================== 6. 用品字典管理（防重复 + 修改数量守恒折算） ====================
+// ==================== 6. 用品字典管理（防重复 + 修改数量守恒与实时倒挤重算） ====================
 
 type ItemDTO struct {
 	ID         int64   `json:"id"`
@@ -920,35 +974,20 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := db.Begin()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
-		return
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`UPDATE items SET category = ?, name = ?, base_unit = ?, pack_unit = ?, pack_size = ?, updated_at = ? WHERE id = ?`,
+	_, err = db.Exec(`UPDATE items SET category = ?, name = ?, base_unit = ?, pack_unit = ?, pack_size = ?, updated_at = ? WHERE id = ?`,
 		req.Category, req.Name, req.BaseUnit, req.PackUnit, req.PackSize, nowStr(), itemID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
 	}
 
-	_, err = tx.Exec(`UPDATE consumable_ledger SET pack_qty = ROUND(CAST(base_qty AS REAL) / ?, 2), updated_at = ? WHERE item_id = ?`, req.PackSize, nowStr(), itemID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
-		return
-	}
+	// 按基本数量重算全周期倒挤包装数量
+	reconcileItemPackQuantities(itemID)
 
 	writeAudit("修改基础用品字典", fmt.Sprintf("ID=%d (%s)", itemID, req.Name),
-		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算历史包装数", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
+		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算并倒挤历史包装数", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品信息已修改，历史台账包装数量已按基本数量重新折算"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品信息已修改，历史台账包装数量已按基本数量重新倒挤折算"})
 }
 
 func natureLabel(n string) string {
@@ -958,7 +997,7 @@ func natureLabel(n string) string {
 	return "消耗品"
 }
 
-// ==================== 7. 消耗品入库与领用流水账（整数基本数量 + 连续登记时序校验 + 移动加权出库成本） ====================
+// ==================== 7. 消耗品入库与领用流水账（实时倒挤包装尾差 + 时序校验 + 移动加权成本） ====================
 
 func generateNextConsumableSerial(tx *sql.Tx, year int) (int, string, error) {
 	var maxSeq sql.NullInt64
@@ -1043,7 +1082,6 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		}
 		rows.Close()
 
-		// 计算每笔领用记录的移动加权出库成本
 		allOutCost := make(map[int64]float64)
 		for itID := range distinctItems {
 			_, costMap := replayConsumableMovingAvg(itID, "", "")
@@ -1072,7 +1110,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 				"tx_type":      rItem.tType,
 				"tx_date":      rItem.tDate,
 				"base_qty":     rItem.bQty,
-				"pack_qty":     calcPackDisplay(rItem.bQty, rItem.pSize),
+				"pack_qty":     rItem.pQty, // 直接返回每次登记实时倒挤校准后的包装数
 				"total_amount": rItem.totAmt,
 				"out_amount":   outCost,
 				"unit_price":   rItem.uPrice,
@@ -1101,7 +1139,6 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		if req.TxDate == "" {
 			req.TxDate = todayStr()
 		}
-		// 严格校验基本数量为正整数
 		if req.BaseQty <= 0 || math.Abs(req.BaseQty-math.Round(req.BaseQty)) > 0.0001 {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "基本数量必须为大于 0 的整数（最小计量单位不可取小数）"})
 			return
@@ -1130,7 +1167,6 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			yearPart = time.Now().Year()
 		}
 
-		// 1. 校验年度结转锁定：不得向已结转年度補录记录（除非输入管理员最高权限口令）
 		var maxCarryYear sql.NullInt64
 		_ = db.QueryRow(`SELECT MAX(carry_year) FROM annual_carryover`).Scan(&maxCarryYear)
 		isBackdate := false
@@ -1141,7 +1177,6 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			backdateReason = fmt.Sprintf("%d年度已完成年度结转锁定", yearPart)
 		}
 
-		// 2. 校验连续登记时序：不得在已有更晚日期记录的情况下补登前期记录（除非输入管理员最高权限口令）
 		var latestDate sql.NullString
 		_ = db.QueryRow(`SELECT MAX(tx_date) FROM consumable_ledger WHERE item_id = ?`, req.ItemID).Scan(&latestDate)
 		if !isBackdate && latestDate.Valid && latestDate.String != "" && req.TxDate < latestDate.String {
@@ -1167,7 +1202,6 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 3. 校验全周期库存与时间点库存防负数
 		if req.TxType == "OUT" {
 			if strings.TrimSpace(req.Recipient) == "" {
 				writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "领用登记必须填写领用人"})
@@ -1191,7 +1225,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		packQty := calcPackDisplay(intBaseQty, packSize)
+		initPackQty := calcPackDisplay(intBaseQty, packSize)
 		unitPrice := 0.0
 		if req.TxType == "IN" && req.TotalAmount > 0 {
 			unitPrice = round4(req.TotalAmount / float64(intBaseQty))
@@ -1214,7 +1248,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		res, err := tx.Exec(`
 			INSERT INTO consumable_ledger (ledger_year, seq_num, serial_no, item_id, tx_type, tx_date, base_qty, pack_qty, total_amount, unit_price, recipient, remark, created_at, updated_at)
 			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			yearPart, seqNum, serialNo, req.ItemID, req.TxType, req.TxDate, intBaseQty, packQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), now, now)
+			yearPart, seqNum, serialNo, req.ItemID, req.TxType, req.TxDate, intBaseQty, initPackQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), now, now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
@@ -1226,6 +1260,12 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// 每次登记后立即执行全周期累计包装进度差额倒挤，消除连续补领过程中的包装尾差
+		reconcileItemPackQuantities(req.ItemID)
+
+		var finalPackQty float64
+		_ = db.QueryRow(`SELECT pack_qty FROM consumable_ledger WHERE id = ?`, newID).Scan(&finalPackQty)
+
 		if isBackdate {
 			writeAudit("特权补录前期/已结转流水", serialNo, fmt.Sprintf("单据日期:%s, 数量:%d, 原因:%s", req.TxDate, intBaseQty, backdateReason))
 		}
@@ -1236,7 +1276,12 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			recordRecipient(req.Recipient)
 		}
 
-		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "id": newID, "serial_no": serialNo})
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":             true,
+			"id":                  newID,
+			"serial_no":           serialNo,
+			"reconciled_pack_qty": finalPackQty,
+		})
 
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"success": false})
@@ -1320,6 +1365,9 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 修正历史单据后，重新对齐全周期累计包装进度倒挤
+	reconcileItemPackQuantities(itemID)
+
 	if txType == "IN" {
 		recalculateItemPriceRange(itemID)
 	} else if req.Recipient != "" {
@@ -1392,7 +1440,6 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 		openPack := calcPackDisplay(snap.OpeningQty, b.PackSize)
 		inPack := calcPackDisplay(snap.PeriodInQty, b.PackSize)
 		closePack := calcPackDisplay(snap.StockQty, b.PackSize)
-		// 尾差倒挤平衡公式：确保 期初包装 + 入库包装 - 出库包装 == 期末包装，彻底消除零散领用产生的包装尾差
 		outPack := round2(openPack + inPack - closePack)
 		if snap.PeriodOutQty == 0 {
 			outPack = 0
@@ -1521,7 +1568,6 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 	minP := prices[0]
 	maxP := prices[len(prices)-1]
 
-	// 计算样本均值、加权均价、中位数与标准差
 	var sum float64
 	for _, p := range prices {
 		sum += p
@@ -1541,7 +1587,6 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 	reasonableLow := math.Max(minP, round2(mean-stdDev))
 	reasonableHigh := math.Min(maxP, round2(mean+stdDev))
 
-	// 构建 5 档频率分布直方图（模拟正态/二项分布钟形曲线）
 	binCount := 5
 	type histBin struct {
 		Label      string  `json:"label"`
@@ -1633,7 +1678,6 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 支持管理员撤销/取消指定年度的结转
 	if r.Method == http.MethodDelete {
 		yearStr := r.URL.Query().Get("carry_year")
 		pass := r.URL.Query().Get("admin_passcode")
@@ -2060,7 +2104,6 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 支持管理员最高权限取消报废
 		if action == "UNSCRAP" {
 			if curStatus != "报废" {
 				writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "该资产当前未处于报废状态，无需取消报废"})
@@ -2436,7 +2479,6 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		_ = f.SetCellStyle(sheet, "A2", endCol+"2", metaStyle)
 		_ = f.SetRowHeight(sheet, 2, 20)
 
-		// 设置横向打印且所有列缩放至 1 页宽
 		orient := "landscape"
 		fitToWidth := 1
 		fitToHeight := 0
@@ -2457,7 +2499,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "办公消耗品入库与领用接续流水账"
 		}
-		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "操作类型", "基本数量", "基本单位", "折算包装数", "包装单位", "采购/出库金额(元)", "单价(元)", "领用人", "备注"}
+		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "操作类型", "基本数量", "基本单位", "倒挤包装数", "包装单位", "采购/出库金额(元)", "单价(元)", "领用人", "备注"}
 		setupSheetHeader(sheet, customTitle, len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -2465,22 +2507,22 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
 		rows, _ := db.Query(`
-			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.category, i.name, cl.tx_type, cl.base_qty, i.base_unit, i.pack_size, i.pack_unit, cl.total_amount, cl.unit_price, cl.recipient, cl.remark
+			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.category, i.name, cl.tx_type, cl.base_qty, i.base_unit, cl.pack_qty, i.pack_unit, cl.total_amount, cl.unit_price, cl.recipient, cl.remark
 			FROM consumable_ledger cl JOIN items i ON cl.item_id = i.id
 			WHERE cl.tx_date >= ? AND cl.tx_date <= ?
 			ORDER BY cl.tx_date ASC, cl.ledger_year ASC, cl.seq_num ASC`, startDate, endDate)
 
 		type expLedger struct {
-			id, itID, bQty, pSize                                    int64
+			id, itID, bQty                                           int64
 			sNo, tDate, cat, name, tType, bUnit, pUnit, recip, rmk   string
-			tAmt, uPrice                                             float64
+			pQty, tAmt, uPrice                                       float64
 		}
 		var list []expLedger
 		itemsSet := make(map[int64]bool)
 		if rows != nil {
 			for rows.Next() {
 				var e expLedger
-				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.cat, &e.name, &e.tType, &e.bQty, &e.bUnit, &e.pSize, &e.pUnit, &e.tAmt, &e.uPrice, &e.recip, &e.rmk); err == nil {
+				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.cat, &e.name, &e.tType, &e.bQty, &e.bUnit, &e.pQty, &e.pUnit, &e.tAmt, &e.uPrice, &e.recip, &e.rmk); err == nil {
 					list = append(list, e)
 					itemsSet[e.itID] = true
 				}
@@ -2503,7 +2545,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 				typeZh = "领用"
 				amtShow = outCosts[e.id]
 			}
-			vals := []interface{}{e.sNo, e.tDate, e.cat, e.name, typeZh, e.bQty, e.bUnit, calcPackDisplay(e.bQty, e.pSize), e.pUnit, amtShow, e.uPrice, e.recip, e.rmk}
+			vals := []interface{}{e.sNo, e.tDate, e.cat, e.name, typeZh, e.bQty, e.bUnit, e.pQty, e.pUnit, amtShow, e.uPrice, e.recip, e.rmk}
 			for cIdx, v := range vals {
 				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 				_ = f.SetCellValue(sheet, cell, v)
@@ -2706,16 +2748,14 @@ func buildTrayIconBytes() []byte {
 	const w, h = 32, 32
 	var buf bytes.Buffer
 
-	// ICO File Header (6 bytes)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(0)) // Reserved
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1)) // Type: ICO
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1)) // Image count: 1
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
 
 	pixelDataSize := w * h * 4
 	maskDataSize := (w / 8) * h
 	dibSize := 40 + pixelDataSize + maskDataSize
 
-	// ICO Directory Entry (16 bytes)
 	buf.WriteByte(w)
 	buf.WriteByte(h)
 	buf.WriteByte(0)
@@ -2725,10 +2765,9 @@ func buildTrayIconBytes() []byte {
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(dibSize))
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(22))
 
-	// BITMAPINFOHEADER (40 bytes)
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(40))
 	_ = binary.Write(&buf, binary.LittleEndian, int32(w))
-	_ = binary.Write(&buf, binary.LittleEndian, int32(h*2)) // XOR + AND mask height
+	_ = binary.Write(&buf, binary.LittleEndian, int32(h*2))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(32))
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
@@ -2738,21 +2777,16 @@ func buildTrayIconBytes() []byte {
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(0))
 
-	// Bottom-to-top BGRA pixels: 现代宝蓝色圆角卡片 + 白色台账横线图标
 	for y := h - 1; y >= 0; y-- {
 		for x := 0; x < w; x++ {
 			b, g, r, a := uint8(0), uint8(0), uint8(0), uint8(0)
-			// 圆角矩形主体 (2..29)
 			inBox := x >= 2 && x <= 29 && y >= 2 && y <= 29
 			isCorner := (x <= 3 && y <= 3) || (x >= 28 && y <= 3) || (x <= 3 && y >= 28) || (x >= 28 && y >= 28)
 			if inBox && !isCorner {
-				// 渐变宝蓝背景 (#2563EB)
 				r, g, b, a = 37, 99, 235, 255
-				// 顶部金色/亮青书签条
 				if y >= 6 && y <= 8 && x >= 7 && x <= 24 {
 					r, g, b = 147, 197, 253
 				}
-				// 三条白色账本横线
 				if (y >= 12 && y <= 13 && x >= 7 && x <= 24) ||
 					(y >= 17 && y <= 18 && x >= 7 && x <= 24) ||
 					(y >= 22 && y <= 23 && x >= 7 && x <= 19) {
@@ -2762,7 +2796,6 @@ func buildTrayIconBytes() []byte {
 			buf.Write([]byte{b, g, r, a})
 		}
 	}
-	// AND Mask (all 0)
 	buf.Write(make([]byte, maskDataSize))
 	return buf.Bytes()
 }
