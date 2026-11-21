@@ -1,0 +1,42 @@
+name: Build Office Ledger Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: 1. 检出源码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Go 1.22 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: 3. 整理并下载纯 Go 模块依赖
+        run: go mod tidy
+
+      - name: 4. 执行全量自动化回归测试
+        run: go test -v ./...
+
+      - name: 5. 编译无控制台黑框的单文件 Windows EXE
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -ldflags="-s -w -H windowsgui" -o dist/OfficeLedgerManager.exe .
+
+      - name: 6. 上传编译产物到 GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfficeLedgerManager-Windows-EXE
+          path: dist/OfficeLedgerManager.exe
+          if-no-files-found: error
