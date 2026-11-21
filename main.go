@@ -161,6 +161,7 @@ func initDatabase() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS items (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		item_code TEXT NOT NULL DEFAULT '',
 		category TEXT NOT NULL,
 		name TEXT NOT NULL,
 		nature TEXT NOT NULL CHECK(nature IN ('consumable', 'reusable')),
@@ -169,9 +170,9 @@ func initDatabase() error {
 		pack_size INTEGER NOT NULL DEFAULT 1,
 		min_price REAL NOT NULL DEFAULT 0,
 		max_price REAL NOT NULL DEFAULT 0,
+		is_deleted INTEGER NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL,
-		UNIQUE(category, nature, name)
+		updated_at TEXT NOT NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS consumable_ledger (
@@ -270,12 +271,38 @@ func initDatabase() error {
 		return err
 	}
 
+	// 兼容旧版本数据库平滑迁移字段
 	_, _ = db.Exec(`ALTER TABLE annual_carryover ADD COLUMN closing_value REAL NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0`)
+	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN item_code TEXT NOT NULL DEFAULT ''`)
 
 	seedDefaultItems()
+	ensureAllItemCodes()
 	syncAllItemPriceRanges()
 	autoDailyBackup()
 	return nil
+}
+
+func formatItemCode(id int64) string {
+	return fmt.Sprintf("YP-%04d", id)
+}
+
+func ensureAllItemCodes() {
+	rows, err := db.Query(`SELECT id FROM items WHERE item_code = '' OR item_code IS NULL`)
+	if err != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		_, _ = db.Exec(`UPDATE items SET item_code = ? WHERE id = ?`, formatItemCode(id), id)
+	}
 }
 
 func seedDefaultItems() {
@@ -298,13 +325,18 @@ func seedDefaultItems() {
 		{"办公家具", "人体工学办公椅", "reusable", "把", "箱", 1},
 		{"办公家具", "双门文件柜", "reusable", "组", "件", 1},
 	}
-	stmt, err := db.Prepare(`INSERT OR IGNORE INTO items (category, name, nature, base_unit, pack_unit, pack_size, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`)
+	stmt, err := db.Prepare(`INSERT INTO items (category, name, nature, base_unit, pack_unit, pack_size, is_deleted, created_at, updated_at) VALUES (?,?,?,?,?,?,0,?,?)`)
 	if err != nil {
 		return
 	}
 	defer stmt.Close()
 	for _, s := range seeds {
-		_, _ = stmt.Exec(s[0], s[1], s[2], s[3], s[4], s[5], now, now)
+		res, err := stmt.Exec(s[0], s[1], s[2], s[3], s[4], s[5], now, now)
+		if err == nil {
+			if id, err := res.LastInsertId(); err == nil {
+				_, _ = db.Exec(`UPDATE items SET item_code = ? WHERE id = ?`, formatItemCode(id), id)
+			}
+		}
 	}
 }
 
@@ -972,10 +1004,11 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ==================== 6. 用品库管理（防重复 + 修改数量守恒折算 + 管理员安全删除） ====================
+// ==================== 6. 用品库管理（专有编码隔离 + 防重 + 修改数量守恒折算 + 零结存归档删除） ====================
 
 type ItemDTO struct {
 	ID         int64   `json:"id"`
+	ItemCode   string  `json:"item_code"`
 	Category   string  `json:"category"`
 	Name       string  `json:"name"`
 	Nature     string  `json:"nature"`
@@ -1007,7 +1040,7 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		category := r.URL.Query().Get("category")
 		kw := strings.TrimSpace(r.URL.Query().Get("kw"))
 
-		query := `SELECT id, category, name, nature, base_unit, pack_unit, pack_size, min_price, max_price, created_at FROM items WHERE 1=1`
+		query := `SELECT id, item_code, category, name, nature, base_unit, pack_unit, pack_size, min_price, max_price, created_at FROM items WHERE is_deleted = 0`
 		var args []interface{}
 		if nature != "" {
 			query += ` AND nature = ?`
@@ -1018,8 +1051,8 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 			args = append(args, category)
 		}
 		if kw != "" {
-			query += ` AND (name LIKE ? OR category LIKE ?)`
-			args = append(args, "%"+kw+"%", "%"+kw+"%")
+			query += ` AND (name LIKE ? OR category LIKE ? OR item_code LIKE ?)`
+			args = append(args, "%"+kw+"%", "%"+kw+"%", "%"+kw+"%")
 		}
 		query += ` ORDER BY category ASC, id ASC`
 
@@ -1032,7 +1065,7 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 		list := make([]ItemDTO, 0)
 		for rows.Next() {
 			var it ItemDTO
-			if err := rows.Scan(&it.ID, &it.Category, &it.Name, &it.Nature, &it.BaseUnit, &it.PackUnit, &it.PackSize, &it.MinPrice, &it.MaxPrice, &it.CreatedAt); err != nil {
+			if err := rows.Scan(&it.ID, &it.ItemCode, &it.Category, &it.Name, &it.Nature, &it.BaseUnit, &it.PackUnit, &it.PackSize, &it.MinPrice, &it.MaxPrice, &it.CreatedAt); err != nil {
 				continue
 			}
 			list = append(list, it)
@@ -1082,25 +1115,29 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 			req.PackSize = 1
 		}
 
+		// 仅与当前启用中（is_deleted = 0）的用品比对重名；已停用归档的旧规格用品不阻断新规格建档
 		var exists int
-		_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ?`, req.Category, req.Nature, req.Name).Scan(&exists)
+		_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ? AND is_deleted = 0`, req.Category, req.Nature, req.Name).Scan(&exists)
 		if exists > 0 {
 			writeJSON(w, http.StatusConflict, map[string]interface{}{
 				"success": false,
-				"message": fmt.Sprintf("重复拦截：分类【%s】下的【%s】已存在同名用品【%s】！", req.Category, natureLabel(req.Nature), req.Name),
+				"message": fmt.Sprintf("重复拦截：分类【%s】下的【%s】已存在在用同名用品【%s】！", req.Category, natureLabel(req.Nature), req.Name),
 			})
 			return
 		}
 
 		now := nowStr()
-		res, err := db.Exec(`INSERT INTO items (category, name, nature, base_unit, pack_unit, pack_size, min_price, max_price, created_at, updated_at) VALUES (?,?,?,?,?,?,0,0,?,?)`,
+		res, err := db.Exec(`INSERT INTO items (category, name, nature, base_unit, pack_unit, pack_size, min_price, max_price, is_deleted, created_at, updated_at) VALUES (?,?,?,?,?,?,0,0,0,?,?)`,
 			req.Category, req.Name, req.Nature, req.BaseUnit, req.PackUnit, req.PackSize, now, now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
 		id, _ := res.LastInsertId()
-		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "id": id})
+		itemCode := formatItemCode(id)
+		_, _ = db.Exec(`UPDATE items SET item_code = ? WHERE id = ?`, itemCode, id)
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "id": id, "item_code": itemCode})
 
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]interface{}{"success": false})
@@ -1121,20 +1158,50 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]interface{}{"success": false, "message": "验证失败：删除用品库条目需要输入管理员口令！"})
 			return
 		}
-		var cat, name, nature string
-		err := db.QueryRow(`SELECT category, name, nature FROM items WHERE id = ?`, itemID).Scan(&cat, &name, &nature)
-		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "未找到该用品信息"})
+		var itemCode, cat, name, nature, baseUnit string
+		var isDeleted int
+		err := db.QueryRow(`SELECT item_code, category, name, nature, base_unit, is_deleted FROM items WHERE id = ?`, itemID).Scan(&itemCode, &cat, &name, &nature, &baseUnit, &isDeleted)
+		if err != nil || isDeleted == 1 {
+			writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "未找到该用品信息或已被删除"})
 			return
+		}
+
+		// 安全前置校验：必须当前库存归零（无在库/在用物资）才允许删除，防止未用完误删
+		if nature == "consumable" {
+			snap, _ := replayConsumableMovingAvg(itemID, "", "")
+			if snap.StockQty > 0 {
+				writeJSON(w, http.StatusConflict, map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("拦截：用品【%s %s】当前仍有结存 %d %s（价值 %.2f 元），请全部领用出库清零后再从用品库删除！", itemCode, name, snap.StockQty, baseUnit, snap.StockValue),
+				})
+				return
+			}
+		} else {
+			var activeAssets int
+			_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE item_id = ? AND status != '报废'`, itemID).Scan(&activeAssets)
+			if activeAssets > 0 {
+				writeJSON(w, http.StatusConflict, map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("拦截：复用品【%s %s】名下仍有 %d 件在库或正在使用的资产，需全部报废处置后才可从用品库移除！", itemCode, name, activeAssets),
+				})
+				return
+			}
 		}
 
 		var ledgerCnt, assetCnt int
 		_ = db.QueryRow(`SELECT COUNT(1) FROM consumable_ledger WHERE item_id = ?`, itemID).Scan(&ledgerCnt)
 		_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE item_id = ?`, itemID).Scan(&assetCnt)
+
 		if ledgerCnt > 0 || assetCnt > 0 {
-			writeJSON(w, http.StatusConflict, map[string]interface{}{
-				"success": false,
-				"message": fmt.Sprintf("安全拦截：用品【%s】已有 %d 条消耗品流水及 %d 条类资产档案关联，为保障账目完整性禁止删除！", name, ledgerCnt, assetCnt),
+			if _, err := db.Exec(`UPDATE items SET is_deleted = 1, updated_at = ? WHERE id = ?`, nowStr(), itemID); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
+				return
+			}
+			writeAudit("删除用品库条目(保留历史账目)", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name),
+				fmt.Sprintf("已确认当前结存为0，从用品库停用移除；原有 %d 条历史流水及 %d 条资产履历完整封存保留", ledgerCnt, assetCnt))
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("已从用品库中删除【%s %s】，其原有的 %d 条历史台账流水与统计数据已完整封存不受任何影响！后续若重新录入同名新规格用品将分配新专有编码。", itemCode, name, ledgerCnt+assetCnt),
 			})
 			return
 		}
@@ -1144,8 +1211,8 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
-		writeAudit("删除用品库条目", fmt.Sprintf("ID=%d (%s/%s)", itemID, cat, name), fmt.Sprintf("性质：%s，确认无历史流水/资产关联后删除", natureLabel(nature)))
-		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("已从用品库中删除【%s】", name)})
+		writeAudit("删除用品库条目", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name), fmt.Sprintf("性质：%s，无历史业务记录，已清理", natureLabel(nature)))
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("已从用品库中删除【%s %s】", itemCode, name)})
 		return
 	}
 
@@ -1172,9 +1239,9 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var oldCat, oldName, nature, oldBaseUnit, oldPackUnit string
+	var itemCode, oldCat, oldName, nature, oldBaseUnit, oldPackUnit string
 	var oldPackSize int64
-	err = db.QueryRow(`SELECT category, name, nature, base_unit, pack_unit, pack_size FROM items WHERE id = ?`, itemID).Scan(&oldCat, &oldName, &nature, &oldBaseUnit, &oldPackUnit, &oldPackSize)
+	err = db.QueryRow(`SELECT item_code, category, name, nature, base_unit, pack_unit, pack_size FROM items WHERE id = ? AND is_deleted = 0`, itemID).Scan(&itemCode, &oldCat, &oldName, &nature, &oldBaseUnit, &oldPackUnit, &oldPackSize)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "未找到该用品信息"})
 		return
@@ -1189,7 +1256,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var dup int
-	_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ? AND id != ?`, req.Category, nature, req.Name, itemID).Scan(&dup)
+	_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ? AND is_deleted = 0 AND id != ?`, req.Category, nature, req.Name, itemID).Scan(&dup)
 	if dup > 0 {
 		writeJSON(w, http.StatusConflict, map[string]interface{}{"success": false, "message": "修改失败：目标分类下已存在同名同性质用品！"})
 		return
@@ -1204,7 +1271,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 
 	reconcileItemPackQuantities(itemID)
 
-	writeAudit("修改用品库信息", fmt.Sprintf("ID=%d (%s)", itemID, req.Name),
+	writeAudit("修改用品库信息", fmt.Sprintf("%s (%s)", itemCode, req.Name),
 		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算折算包装数量", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品库信息已修改，历史台账折算包装数量已按基本数量重新计算"})
@@ -1231,7 +1298,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 
 		q := `
 		SELECT cl.id, cl.ledger_year, cl.seq_num, cl.serial_no, cl.item_id,
-		       i.category, i.name, i.base_unit, i.pack_unit, i.pack_size,
+		       i.item_code, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, i.is_deleted,
 		       cl.tx_type, cl.tx_date, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price,
 		       cl.recipient, cl.remark, cl.created_at
 		FROM consumable_ledger cl
@@ -1245,10 +1312,11 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		}
 
 		type rawLedgerRow struct {
-			id, lYear, seqNum, itID, pSize, bQty                int64
-			serialNo, cat, name, bUnit, pUnit, tType, tDate     string
-			recip, rmk, createdAt                               string
-			pQty, totAmt, uPrice                                float64
+			id, lYear, seqNum, itID, pSize, bQty                          int64
+			isDeleted                                                     int
+			serialNo, itCode, cat, name, bUnit, pUnit, tType, tDate       string
+			recip, rmk, createdAt                                         string
+			pQty, totAmt, uPrice                                          float64
 		}
 		var rawList []rawLedgerRow
 		distinctItems := make(map[int64]bool)
@@ -1256,7 +1324,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		for rows.Next() {
 			var rItem rawLedgerRow
 			if err := rows.Scan(&rItem.id, &rItem.lYear, &rItem.seqNum, &rItem.serialNo, &rItem.itID,
-				&rItem.cat, &rItem.name, &rItem.bUnit, &rItem.pUnit, &rItem.pSize,
+				&rItem.itCode, &rItem.cat, &rItem.name, &rItem.bUnit, &rItem.pUnit, &rItem.pSize, &rItem.isDeleted,
 				&rItem.tType, &rItem.tDate, &rItem.bQty, &rItem.pQty, &rItem.totAmt, &rItem.uPrice,
 				&rItem.recip, &rItem.rmk, &rItem.createdAt); err == nil {
 				rawList = append(rawList, rItem)
@@ -1335,8 +1403,10 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 				"seq_num":      rItem.seqNum,
 				"serial_no":    rItem.serialNo,
 				"item_id":      rItem.itID,
+				"item_code":    rItem.itCode,
 				"category":     rItem.cat,
 				"item_name":    rItem.name,
+				"is_archived":  rItem.isDeleted == 1,
 				"base_unit":    rItem.bUnit,
 				"pack_unit":    rItem.pUnit,
 				"pack_size":    rItem.pSize,
@@ -1392,9 +1462,14 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 
 		var nature string
 		var packSize int64
-		err := db.QueryRow(`SELECT nature, pack_size FROM items WHERE id = ?`, req.ItemID).Scan(&nature, &packSize)
+		var isDeleted int
+		err := db.QueryRow(`SELECT nature, pack_size, is_deleted FROM items WHERE id = ?`, req.ItemID).Scan(&nature, &packSize, &isDeleted)
 		if err != nil {
 			writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "未找到所选用品"})
+			return
+		}
+		if isDeleted == 1 {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "该用品编码已从用品库移除封存，不可新增出入库记录"})
 			return
 		}
 		if nature != "consumable" {
@@ -1695,17 +1770,19 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "serial_no": finalSerialNo, "message": "流水记录已修正，全年度序号已连续重排并闭合"})
 }
 
-// ==================== 8. 会计级期初/期末盘点 ====================
+// ==================== 8. 会计级期初/期末盘点（支持专有编码区分新旧规格） ====================
 
 type consumableBaseInfo struct {
-	ID       int64
-	Category string
-	Name     string
-	BaseUnit string
-	PackUnit string
-	PackSize int64
-	MinPrice float64
-	MaxPrice float64
+	ID        int64
+	ItemCode  string
+	Category  string
+	Name      string
+	BaseUnit  string
+	PackUnit  string
+	PackSize  int64
+	MinPrice  float64
+	MaxPrice  float64
+	IsDeleted int
 }
 
 func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
@@ -1722,7 +1799,7 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 		endDate = todayStr()
 	}
 
-	q := `SELECT id, category, name, base_unit, pack_unit, pack_size, min_price, max_price FROM items WHERE nature = 'consumable'`
+	q := `SELECT id, item_code, category, name, base_unit, pack_unit, pack_size, min_price, max_price, is_deleted FROM items WHERE nature = 'consumable'`
 	var args []interface{}
 	if category != "" {
 		q += ` AND category = ?`
@@ -1743,7 +1820,7 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 	var baseList []consumableBaseInfo
 	for rows.Next() {
 		var b consumableBaseInfo
-		if err := rows.Scan(&b.ID, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice); err == nil {
+		if err := rows.Scan(&b.ID, &b.ItemCode, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice, &b.IsDeleted); err == nil {
 			baseList = append(baseList, b)
 		}
 	}
@@ -1756,6 +1833,11 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 	for _, b := range baseList {
 		snap, _ := replayConsumableMovingAvg(b.ID, startDate, endDate)
 
+		hasPeriodActivity := snap.OpeningQty > 0 || snap.PeriodInQty > 0 || snap.PeriodOutQty > 0 || snap.StockQty > 0
+		if b.IsDeleted == 1 && !hasPeriodActivity {
+			continue
+		}
+
 		if _, ok := catSummaryMap[b.Category]; !ok {
 			catSummaryMap[b.Category] = map[string]interface{}{
 				"category":            b.Category,
@@ -1765,7 +1847,9 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 				"active_skus":         0,
 			}
 		}
-		catSummaryMap[b.Category]["item_count"] = catSummaryMap[b.Category]["item_count"].(int) + 1
+		if b.IsDeleted == 0 {
+			catSummaryMap[b.Category]["item_count"] = catSummaryMap[b.Category]["item_count"].(int) + 1
+		}
 		catSummaryMap[b.Category]["total_closing_value"] = round2(catSummaryMap[b.Category]["total_closing_value"].(float64) + snap.StockValue)
 		catSummaryMap[b.Category]["total_in_amt"] = round2(catSummaryMap[b.Category]["total_in_amt"].(float64) + snap.PeriodInValue)
 		if snap.StockQty > 0 {
@@ -1787,11 +1871,18 @@ func handleConsumableInventory(w http.ResponseWriter, r *http.Request) {
 			spec = fmt.Sprintf("1%s", b.BaseUnit)
 		}
 
+		displayName := b.Name
+		if b.IsDeleted == 1 {
+			displayName = b.Name + " (已停用)"
+		}
+
 		rowObj := map[string]interface{}{
 			"seq":               displaySeq,
 			"item_id":           b.ID,
+			"item_code":         b.ItemCode,
 			"category":          b.Category,
-			"item_name":         b.Name,
+			"item_name":         displayName,
+			"is_archived":       b.IsDeleted == 1,
 			"base_unit":         b.BaseUnit,
 			"pack_unit":         b.PackUnit,
 			"pack_size":         b.PackSize,
@@ -1847,8 +1938,8 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var cat, name, bUnit string
-	if err := db.QueryRow(`SELECT category, name, base_unit FROM items WHERE id = ?`, itemID).Scan(&cat, &name, &bUnit); err != nil {
+	var itemCode, cat, name, bUnit string
+	if err := db.QueryRow(`SELECT item_code, category, name, base_unit FROM items WHERE id = ?`, itemID).Scan(&itemCode, &cat, &name, &bUnit); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "用品不存在"})
 		return
 	}
@@ -1887,7 +1978,7 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 
 	if len(prices) == 0 {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"success": true, "has_data": false, "item_name": name, "category": cat, "base_unit": bUnit,
+			"success": true, "has_data": false, "item_code": itemCode, "item_name": name, "category": cat, "base_unit": bUnit,
 		})
 		return
 	}
@@ -1968,6 +2059,7 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":         true,
 		"has_data":        true,
+		"item_code":       itemCode,
 		"item_name":       name,
 		"category":        cat,
 		"base_unit":       bUnit,
@@ -2063,7 +2155,7 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 	autoDailyBackup()
 
 	yearEndDate := fmt.Sprintf("%d-12-31", req.CarryYear)
-	rows, err := db.Query(`SELECT id FROM items WHERE nature = 'consumable'`)
+	rows, err := db.Query(`SELECT id FROM items WHERE nature = 'consumable' AND is_deleted = 0`)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
@@ -2186,7 +2278,7 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 		kw := strings.TrimSpace(r.URL.Query().Get("kw"))
 
 		q := `
-		SELECT ra.id, ra.asset_no, ra.item_id, i.category, i.name, i.base_unit,
+		SELECT ra.id, ra.asset_no, ra.item_id, i.item_code, i.category, i.name, i.base_unit,
 		       ra.sub_name, ra.purchase_date, ra.unit_price, ra.expected_years,
 		       ra.status, ra.current_user, ra.image_path, ra.scrap_date, ra.scrap_file_path, ra.remark, ra.created_at
 		FROM reusable_assets ra
@@ -2206,9 +2298,9 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 			args = append(args, status)
 		}
 		if kw != "" {
-			q += ` AND (ra.asset_no LIKE ? OR ra.sub_name LIKE ? OR ra.current_user LIKE ? OR i.name LIKE ?)`
+			q += ` AND (ra.asset_no LIKE ? OR ra.sub_name LIKE ? OR ra.current_user LIKE ? OR i.name LIKE ? OR i.item_code LIKE ?)`
 			like := "%" + kw + "%"
-			args = append(args, like, like, like, like)
+			args = append(args, like, like, like, like, like)
 		}
 		q += ` ORDER BY ra.asset_no ASC, ra.id ASC`
 
@@ -2227,8 +2319,8 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 			var id, itID int64
 			var expYears int
 			var uPrice float64
-			var assetNo, cat, itName, bUnit, subName, pDate, st, curUser, imgPath, sDate, sFile, rmk, cAt string
-			if err := rows.Scan(&id, &assetNo, &itID, &cat, &itName, &bUnit, &subName, &pDate, &uPrice, &expYears,
+			var assetNo, itCode, cat, itName, bUnit, subName, pDate, st, curUser, imgPath, sDate, sFile, rmk, cAt string
+			if err := rows.Scan(&id, &assetNo, &itID, &itCode, &cat, &itName, &bUnit, &subName, &pDate, &uPrice, &expYears,
 				&st, &curUser, &imgPath, &sDate, &sFile, &rmk, &cAt); err != nil {
 				continue
 			}
@@ -2247,6 +2339,7 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 				"id":              id,
 				"asset_no":        assetNo,
 				"item_id":         itID,
+				"item_code":       itCode,
 				"category":        cat,
 				"item_name":       itName,
 				"base_unit":       bUnit,
@@ -2306,8 +2399,9 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 		remark := strings.TrimSpace(r.FormValue("remark"))
 
 		var cat, itName, nature string
-		err := db.QueryRow(`SELECT category, name, nature FROM items WHERE id = ?`, itemID).Scan(&cat, &itName, &nature)
-		if err != nil || nature != "reusable" {
+		var isDeleted int
+		err := db.QueryRow(`SELECT category, name, nature, is_deleted FROM items WHERE id = ?`, itemID).Scan(&cat, &itName, &nature, &isDeleted)
+		if err != nil || nature != "reusable" || isDeleted == 1 {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "请选择有效的复用品(类资产)品名"})
 			return
 		}
@@ -2658,7 +2752,7 @@ func handleAllReusableLogs(w http.ResponseWriter, r *http.Request) {
 	category := r.URL.Query().Get("category")
 	itemID := r.URL.Query().Get("item_id")
 	q := `
-		SELECT rl.id, rl.log_no, ra.asset_no, i.category, i.name, ra.sub_name,
+		SELECT rl.id, rl.log_no, ra.asset_no, i.item_code, i.category, i.name, ra.sub_name,
 		       rl.action_type, rl.action_date, rl.operator_or_user, rl.detail, rl.attachment_path, rl.created_at
 		FROM reusable_logs rl
 		JOIN reusable_assets ra ON rl.asset_id = ra.id
@@ -2685,10 +2779,10 @@ func handleAllReusableLogs(w http.ResponseWriter, r *http.Request) {
 	list := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id int64
-		var logNo, assetNo, cat, itName, subName, aType, aDate, opUser, det, att, cAt string
-		_ = rows.Scan(&id, &logNo, &assetNo, &cat, &itName, &subName, &aType, &aDate, &opUser, &det, &att, &cAt)
+		var logNo, assetNo, itCode, cat, itName, subName, aType, aDate, opUser, det, att, cAt string
+		_ = rows.Scan(&id, &logNo, &assetNo, &itCode, &cat, &itName, &subName, &aType, &aDate, &opUser, &det, &att, &cAt)
 		list = append(list, map[string]interface{}{
-			"id": id, "log_no": logNo, "asset_no": assetNo, "category": cat,
+			"id": id, "log_no": logNo, "asset_no": assetNo, "item_code": itCode, "category": cat,
 			"item_name": itName, "sub_name": subName, "action_type": aType,
 			"action_date": aDate, "operator_or_user": opUser, "detail": det,
 			"attachment_path": att, "created_at": cAt,
@@ -2862,7 +2956,7 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 }
 
-// ==================== 11. Excel 专业导出 ====================
+// ==================== 11. Excel 专业导出（包含专有用品编码列） ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
@@ -2977,8 +3071,8 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "办公消耗品入库与领用接续流水账"
 		}
-		headers := []string{"流水编号", "登记日期", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注"}
-		moneyCols := map[int]bool{12: true, 13: true}
+		headers := []string{"流水编号", "登记日期", "用品编码", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注"}
+		moneyCols := map[int]bool{13: true, 14: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -2986,22 +3080,22 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
 		rows, _ := db.Query(`
-			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, cl.tx_type, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price, cl.recipient, cl.remark
+			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.item_code, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, cl.tx_type, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price, cl.recipient, cl.remark
 			FROM consumable_ledger cl JOIN items i ON cl.item_id = i.id
 			WHERE cl.tx_date >= ? AND cl.tx_date <= ?
 			ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`, startDate, endDate)
 
 		type expLedger struct {
-			id, itID, bQty, pSize                                    int64
-			sNo, tDate, cat, name, bUnit, pUnit, tType, recip, rmk   string
-			pQty, tAmt, uPrice                                       float64
+			id, itID, bQty, pSize                                            int64
+			sNo, tDate, itCode, cat, name, bUnit, pUnit, tType, recip, rmk   string
+			pQty, tAmt, uPrice                                               float64
 		}
 		var list []expLedger
 		itemsSet := make(map[int64]bool)
 		if rows != nil {
 			for rows.Next() {
 				var e expLedger
-				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.cat, &e.name, &e.bUnit, &e.pUnit, &e.pSize, &e.tType, &e.bQty, &e.pQty, &e.tAmt, &e.uPrice, &e.recip, &e.rmk); err == nil {
+				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.itCode, &e.cat, &e.name, &e.bUnit, &e.pUnit, &e.pSize, &e.tType, &e.bQty, &e.pQty, &e.tAmt, &e.uPrice, &e.recip, &e.rmk); err == nil {
 					list = append(list, e)
 					itemsSet[e.itID] = true
 				}
@@ -3031,7 +3125,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			if e.pUnit == "" {
 				spec = fmt.Sprintf("1%s", e.bUnit)
 			}
-			vals := []interface{}{e.sNo, e.tDate, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, det.BeforeQty, e.bQty, det.AfterQty, e.pQty, amtShow, unitShow, e.recip, e.rmk}
+			vals := []interface{}{e.sNo, e.tDate, e.itCode, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, det.BeforeQty, e.bQty, det.AfterQty, e.pQty, amtShow, unitShow, e.recip, e.rmk}
 			for cIdx, v := range vals {
 				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 				_ = f.SetCellValue(sheet, cell, v)
@@ -3051,8 +3145,8 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "企业复用品（类资产）独立编码盘点台账"
 		}
-		headers := []string{"资产编号", "用品分类", "标准品名", "二级品名/位置", "购置日期", "购置单价", "预计年限(年)", "预计处置日期", "当前状态", "当前使用人", "报废日期", "备注"}
-		moneyCols := map[int]bool{5: true}
+		headers := []string{"资产编号", "用品编码", "用品分类", "标准品名", "二级品名/位置", "购置日期", "购置单价", "预计年限(年)", "预计处置日期", "当前状态", "当前使用人", "报废日期", "备注"}
+		moneyCols := map[int]bool{6: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出日期：%s", customOrg, todayStr()), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -3060,17 +3154,17 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
 		rows, _ := db.Query(`
-			SELECT ra.asset_no, i.category, i.name, ra.sub_name, ra.purchase_date, ra.unit_price, ra.expected_years, ra.status, ra.current_user, ra.scrap_date, ra.remark
+			SELECT ra.asset_no, i.item_code, i.category, i.name, ra.sub_name, ra.purchase_date, ra.unit_price, ra.expected_years, ra.status, ra.current_user, ra.scrap_date, ra.remark
 			FROM reusable_assets ra JOIN items i ON ra.item_id = i.id ORDER BY ra.asset_no ASC, ra.id ASC`)
 		rIdx := 4
 		if rows != nil {
 			defer rows.Close()
 			for rows.Next() {
-				var aNo, cat, name, sub, pDate, st, user, sDate, rmk string
+				var aNo, itCode, cat, name, sub, pDate, st, user, sDate, rmk string
 				var uPrice float64
 				var expY int
-				_ = rows.Scan(&aNo, &cat, &name, &sub, &pDate, &uPrice, &expY, &st, &user, &sDate, &rmk)
-				vals := []interface{}{aNo, cat, name, sub, pDate, round2(uPrice), expY, calcDisposalDate(pDate, expY), st, user, sDate, rmk}
+				_ = rows.Scan(&aNo, &itCode, &cat, &name, &sub, &pDate, &uPrice, &expY, &st, &user, &sDate, &rmk)
+				vals := []interface{}{aNo, itCode, cat, name, sub, pDate, round2(uPrice), expY, calcDisposalDate(pDate, expY), st, user, sDate, rmk}
 				for cIdx, v := range vals {
 					cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 					_ = f.SetCellValue(sheet, cell, v)
@@ -3134,26 +3228,26 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			customTitle = "办公消耗品期初/期末盘点与移动加权在库价值报表"
 		}
 		headers := []string{
-			"序号", "用品分类", "品名", "基本单位", "包装单位", "包装规格",
+			"序号", "用品编码", "用品分类", "品名", "基本单位", "包装单位", "包装规格",
 			"期初结存(基本数量)", "期初结存(包装数量)",
 			"本期入库(基本数量)", "本期入库(包装数量)",
 			"本期领用(基本数量)", "本期领用(包装数量)",
 			"期末结存(基本数量)", "期末结存(包装数量)",
 			"平均价", "当前在库价值", "采购价格分布",
 		}
-		moneyCols := map[int]bool{14: true, 15: true}
+		moneyCols := map[int]bool{15: true, 16: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
 			_ = f.SetCellValue(sheet, cell, h)
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
-		rows, _ := db.Query(`SELECT id, category, name, base_unit, pack_unit, pack_size, min_price, max_price FROM items WHERE nature = 'consumable' ORDER BY category ASC, id ASC`)
+		rows, _ := db.Query(`SELECT id, item_code, category, name, base_unit, pack_unit, pack_size, min_price, max_price, is_deleted FROM items WHERE nature = 'consumable' ORDER BY category ASC, id ASC`)
 		var baseList []consumableBaseInfo
 		if rows != nil {
 			for rows.Next() {
 				var b consumableBaseInfo
-				if err := rows.Scan(&b.ID, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice); err == nil {
+				if err := rows.Scan(&b.ID, &b.ItemCode, &b.Category, &b.Name, &b.BaseUnit, &b.PackUnit, &b.PackSize, &b.MinPrice, &b.MaxPrice, &b.IsDeleted); err == nil {
 					baseList = append(baseList, b)
 				}
 			}
@@ -3164,6 +3258,10 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		seqNum := 0
 		for _, b := range baseList {
 			snap, _ := replayConsumableMovingAvg(b.ID, startDate, endDate)
+			hasPeriodActivity := snap.OpeningQty > 0 || snap.PeriodInQty > 0 || snap.PeriodOutQty > 0 || snap.StockQty > 0
+			if b.IsDeleted == 1 && !hasPeriodActivity {
+				continue
+			}
 			if hideZero && snap.StockQty == 0 {
 				continue
 			}
@@ -3172,8 +3270,12 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			if b.PackUnit == "" {
 				spec = fmt.Sprintf("1%s", b.BaseUnit)
 			}
+			displayName := b.Name
+			if b.IsDeleted == 1 {
+				displayName = b.Name + " (已停用)"
+			}
 			vals := []interface{}{
-				seqNum, b.Category, b.Name, b.BaseUnit, b.PackUnit, spec,
+				seqNum, b.ItemCode, b.Category, displayName, b.BaseUnit, b.PackUnit, spec,
 				snap.OpeningQty, calcPackDisplay(snap.OpeningQty, b.PackSize),
 				snap.PeriodInQty, calcPackDisplay(snap.PeriodInQty, b.PackSize),
 				snap.PeriodOutQty, calcPackDisplay(snap.PeriodOutQty, b.PackSize),
