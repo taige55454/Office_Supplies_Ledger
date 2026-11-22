@@ -5,7 +5,8 @@ let authState = {
   port: 8088,
   lan_urls: [],
   allow_lan: true,
-  org_name: '综合行政部'
+  org_name: '综合行政部',
+  token_expire_hours: 4
 };
 
 let allItems = [];
@@ -32,6 +33,8 @@ async function apiFetch(url, options = {}) {
   options.headers = headers;
   const resp = await fetch(url, options);
   if (resp.status === 401) {
+    authState.token = '';
+    localStorage.removeItem('ledger_token');
     document.getElementById('lock-overlay').classList.remove('hidden');
   }
   return resp;
@@ -74,12 +77,12 @@ async function checkAuthAndInit() {
 
   const badge = document.getElementById('role-badge');
   if (authState.role === 'admin') {
-    badge.textContent = authState.is_localhost ? '👑 本机管理员 (全权限)' : '👑 管理员 (全权限)';
+    badge.textContent = authState.is_localhost ? '👑 本机管理员' : '👑 管理员';
     badge.className = 'role-badge admin';
     document.querySelectorAll('.admin-only').forEach(el => el.classList.remove('hidden'));
     document.getElementById('btn-open-settings').classList.remove('hidden');
   } else {
-    badge.textContent = '📝 内网登记员 (只读/录入)';
+    badge.textContent = '📝 内网登记员';
     badge.className = 'role-badge entry';
     document.querySelectorAll('.admin-only').forEach(el => el.classList.add('hidden'));
     document.getElementById('btn-open-settings').classList.add('hidden');
@@ -119,7 +122,7 @@ function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
 }
 
-// ==================== 1. 用品库管理（含专有编码、修改与权限删除） ====================
+// ==================== 1. 用品库管理 ====================
 
 function openDictModal() {
   renderDictTable();
@@ -135,8 +138,7 @@ async function loadItems() {
   const cats = [...new Set(allItems.map(i => i.category))];
   const catOptions = '<option value="">全部分类</option>' + cats.map(c => `<option value="${c}">${c}</option>`).join('');
   document.getElementById('inv-category').innerHTML = catOptions;
-  document.getElementById('ra-category').innerHTML = catOptions;
-  document.getElementById('cat-datalist').innerHTML = cats.map(c => `<option value="${c}">`).join('');
+  document.getElementById('ra-category').innerHTML = catOptions;  document.getElementById('cat-datalist').innerHTML = cats.map(c => `<option value="${c}">`).join('');
 
   onInvCategoryChange();
   renderDictTable();
@@ -330,11 +332,13 @@ function onTxItemChange() {
   const id = parseInt(document.getElementById('tx-item-id').value, 10);
   const it = allItems.find(x => x.id === id);
   if (!it) return;
+  const txType = document.getElementById('tx-type').value;
+  const qtyLabelPrefix = txType === 'IN' ? '入库数量' : '领用数量';
   const spec = it.pack_unit ? `1 ${it.pack_unit} = ${it.pack_size} ${it.base_unit}` : `最小单位：${it.base_unit}`;
   document.getElementById('tx-item-spec-banner').innerHTML =
     `编码：<strong>${it.item_code}</strong> &nbsp;|&nbsp; 规格：<strong>${spec}</strong> &nbsp;|&nbsp; 当前可用结存：<strong>${it.stock_qty} ${it.base_unit}</strong> &nbsp;|&nbsp; 在库价值：<strong>${(it.stock_value || 0).toFixed(2)} 元</strong>`;
-  document.getElementById('tx-base-label').textContent = `入库/领用数量 (${it.base_unit}，必须为整数) *`;
-  document.getElementById('tx-pack-label').textContent = `参考包装数量 (${it.pack_unit || '件'}，填写可自动算基本数量)`;
+  document.getElementById('tx-base-label').textContent = `${qtyLabelPrefix} (${it.base_unit}) *`;
+  document.getElementById('tx-pack-label').textContent = `参考包装数量 (${it.pack_unit || '件'})`;
   onBaseQtyInput();
 }
 
@@ -379,7 +383,7 @@ function onPackQtyInput() {
 
   const warnEl = document.getElementById('tx-pack-warning');
   if (Math.abs(pQty * it.pack_size - bQty) > 0.001) {
-    warnEl.textContent = `💡 已按包装规格自动取整为基本数量【${bQty} ${it.base_unit}】（最小计量单位不可取小数）。`;
+    warnEl.textContent = `💡 已按包装规格自动取整为基本数量【${bQty} ${it.base_unit}】。`;
     warnEl.classList.remove('hidden');
   } else {
     warnEl.classList.add('hidden');
@@ -402,7 +406,7 @@ async function submitConsumableTx() {
   const rawQty = document.getElementById('tx-base-qty').value;
   const bQty = Number(rawQty);
   if (!rawQty || !Number.isInteger(bQty) || bQty <= 0) {
-    alert('入库/领用数量必须为大于 0 的整数！');
+    alert('数量必须为大于 0 的整数！');
     return;
   }
 
@@ -560,6 +564,7 @@ function openEditLedgerModal(id) {
   document.getElementById('edit-ledger-id').value = row.id;
   document.getElementById('edit-ledger-packsize').value = row.pack_size || 1;
   document.getElementById('edit-ledger-info').textContent = `正在修正流水：${row.serial_no} | [${row.item_code}] ${row.item_name} (${row.tx_type === 'IN' ? '入库' : '领用'})`;
+  document.getElementById('edit-ledger-qty-label').textContent = `${row.tx_type === 'IN' ? '入库数量' : '领用数量'} (${row.base_unit}) *`;
   document.getElementById('edit-ledger-serial').value = row.serial_no;
   document.getElementById('edit-ledger-date').value = row.tx_date;
   document.getElementById('edit-ledger-qty').value = row.base_qty;
@@ -599,7 +604,7 @@ async function submitEditLedger() {
   const id = document.getElementById('edit-ledger-id').value;
   const bQty = Number(document.getElementById('edit-ledger-qty').value);
   if (!Number.isInteger(bQty) || bQty <= 0) {
-    alert('入库/领用数量必须为正整数！');
+    alert('数量必须为正整数！');
     return;
   }
   const payload = {
@@ -640,7 +645,7 @@ async function openPriceDistModal(itemID) {
   const body = document.getElementById('pd-body');
 
   if (!res.has_data) {
-    body.innerHTML = `<div class="info-banner">该品种暂无带金额的采购入库记录。</div>`;
+    body.innerHTML = `<div class="info-banner">该品种暂无带金额的有效采购入库记录（单价为 0 的划拨物资不计入价格分布统计）。</div>`;
     document.getElementById('modal-price-dist').classList.remove('hidden');
     return;
   }
@@ -676,11 +681,11 @@ async function openPriceDistModal(itemID) {
         <div class="stat-val" style="font-size:17px;">${res.median_price.toFixed(2)} / ${res.mean_price.toFixed(2)}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-title">历史最低 ~ 最高 (样本数)</div>
+        <div class="stat-title">历史最低 ~ 最高 (有效样本)</div>
         <div class="stat-val" style="font-size:16px;">${res.min_price.toFixed(2)} ~ ${res.max_price.toFixed(2)} (${res.batch_total}次)</div>
       </div>
     </div>
-    <div class="hint-text">蓝色柱体表示各价格区间实际采购频次，橙色圆点表示理论正态分布钟形趋势：</div>
+    <div class="hint-text">蓝色柱体表示各价格区间实际采购频次，橙色圆点表示理论正态分布钟形趋势（已自动过滤价格为 0 的划拨入库）：</div>
     <div class="hist-chart">${barsHtml}</div>
     <div class="table-responsive" style="max-height:200px;">
       <table class="data-table">
@@ -1093,6 +1098,7 @@ function openSettingsModal() {
   document.getElementById('set-org-name').value = authState.org_name || '综合行政部';
   document.getElementById('set-port').value = authState.port || 8088;
   document.getElementById('set-allow-lan').value = String(authState.allow_lan);
+  document.getElementById('set-expire-hours').value = authState.token_expire_hours || 4;
   document.getElementById('set-admin-pass').value = authState.admin_passcode || '';
   document.getElementById('set-entry-pass').value = authState.entry_passcode || '';
   document.getElementById('lan-share-box').innerHTML =
@@ -1106,6 +1112,7 @@ async function submitSettings() {
     org_name: document.getElementById('set-org-name').value.trim(),
     port: parseInt(document.getElementById('set-port').value, 10),
     allow_lan: document.getElementById('set-allow-lan').value === 'true',
+    token_expire_hours: parseFloat(document.getElementById('set-expire-hours').value) || 4,
     admin_passcode: document.getElementById('set-admin-pass').value.trim(),
     entry_passcode: document.getElementById('set-entry-pass').value.trim()
   };
@@ -1137,9 +1144,10 @@ async function loadAuditLogs() {
   document.getElementById('tbody-audit-logs').innerHTML = (res.data || []).map(l => `
     <tr>
       <td>${l.created_at}</td>
+      <td><code>${l.client_ip || '-'}</code></td>
       <td><strong>${l.action}</strong></td>
       <td>${l.target_info}</td>
-      <td>${l.detail}</td>
+      <td style="white-space:normal;text-align:left;">${l.detail}</td>
     </tr>
   `).join('');
 }
@@ -1178,6 +1186,13 @@ function openPrintPreview(mode) {
     const metaBanner = document.getElementById('ra-logs-meta').innerHTML;
     tableHtml = `<div style="margin-bottom:10px;font-size:12px;color:#1e293b;border:1px solid #cbd5e1;padding:8px;background:#f8fafc;">${metaBanner}</div>` +
       document.getElementById('table-single-asset-logs').outerHTML;
+    cardsHtml = '';
+    hasCardsOption = false;
+    hasZeroFilterOption = false;
+  } else if (mode === 'audit_logs') {
+    defaultTitle = '系统敏感操作与数据变更审计追踪记录';
+    subRightMeta = `打印日期：${todayStr()}`;
+    tableHtml = document.getElementById('table-audit-logs').outerHTML;
     cardsHtml = '';
     hasCardsOption = false;
     hasZeroFilterOption = false;
