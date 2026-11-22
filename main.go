@@ -807,7 +807,23 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/attachments/") {
+
+		// 附件查看与下载：只要开启了局域网访问（或本机访问），直接放行，无需再弹窗输口令
+		if strings.HasPrefix(path, "/attachments/") {
+			if !isLocalRequest(r) {
+				cfgMutex.RLock()
+				allowLan := appCfg.AllowLan
+				cfgMutex.RUnlock()
+				if !allowLan {
+					writeJSON(w, http.StatusForbidden, map[string]interface{}{"success": false, "message": "主机已关闭内网外部访问"})
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !strings.HasPrefix(path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
