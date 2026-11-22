@@ -267,6 +267,7 @@ func initDatabase() error {
 		unit_price REAL NOT NULL DEFAULT 0,
 		recipient TEXT NOT NULL DEFAULT '',
 		remark TEXT NOT NULL DEFAULT '',
+		client_source TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
 		FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE RESTRICT
@@ -355,6 +356,7 @@ func initDatabase() error {
 	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN item_code TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE audit_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '127.0.0.1'`)
+	_, _ = db.Exec(`ALTER TABLE consumable_ledger ADD COLUMN client_source TEXT NOT NULL DEFAULT ''`)
 
 	seedDefaultItems()
 	ensureAllItemCodes()
@@ -459,7 +461,7 @@ func autoDailyBackup() {
 	}
 }
 
-// ==================== 3. 通用工具函数、全年度连续无断号重排引擎、动态包装倒挤与移动加权成本引擎 ====================
+// ==================== 3. 通用工具函数、全维度终端溯源指纹、重排与移动加权引擎 ====================
 
 func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
@@ -511,7 +513,79 @@ func sanitizeToken(s string) string {
 	return res
 }
 
-func getClientIP(r *http.Request) string {
+type hwCacheEntry struct {
+	info      string
+	expiresAt time.Time
+}
+
+var (
+	hostInfoCache   = make(map[string]hwCacheEntry)
+	hostInfoCacheMu sync.RWMutex
+)
+
+func lookupMacFromARP(targetIP string) string {
+	out, err := exec.Command("arp", "-a", targetIP).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, targetIP) {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			norm := strings.ReplaceAll(strings.ToUpper(field), ":", "-")
+			if len(norm) == 17 && strings.Count(norm, "-") == 5 {
+				return norm
+			}
+		}
+	}
+	return ""
+}
+
+func parseShortUA(ua string) string {
+	if ua == "" {
+		return ""
+	}
+	uaLow := strings.ToLower(ua)
+	osName := ""
+	switch {
+	case strings.Contains(uaLow, "windows nt 10"):
+		osName = "Windows 10/11"
+	case strings.Contains(uaLow, "windows"):
+		osName = "Windows"
+	case strings.Contains(uaLow, "mac os x"):
+		osName = "macOS"
+	case strings.Contains(uaLow, "android"):
+		osName = "Android"
+	case strings.Contains(uaLow, "iphone") || strings.Contains(uaLow, "ipad"):
+		osName = "iOS"
+	case strings.Contains(uaLow, "linux"):
+		osName = "Linux"
+	}
+
+	browser := ""
+	switch {
+	case strings.Contains(uaLow, "edg/"):
+		browser = "Edge"
+	case strings.Contains(uaLow, "chrome/"):
+		browser = "Chrome"
+	case strings.Contains(uaLow, "firefox/"):
+		browser = "Firefox"
+	case strings.Contains(uaLow, "safari/") && !strings.Contains(uaLow, "chrome/"):
+		browser = "Safari"
+	}
+
+	if osName != "" && browser != "" {
+		return osName + " · " + browser
+	}
+	if osName != "" {
+		return osName
+	}
+	return browser
+}
+
+// 获取操作终端组合指纹：IP + 反向DNS计算机主机名 + 网卡物理MAC地址 + 操作系统与浏览器
+func getClientFullIdentity(r *http.Request) string {
 	if r == nil {
 		return "系统内部"
 	}
@@ -522,13 +596,62 @@ func getClientIP(r *http.Request) string {
 	if host == "127.0.0.1" || host == "::1" {
 		return "127.0.0.1 (主机本机)"
 	}
-	return host
+
+	now := time.Now()
+	hostInfoCacheMu.RLock()
+	entry, ok := hostInfoCache[host]
+	hostInfoCacheMu.RUnlock()
+
+	var cachedHw string
+	if ok && now.Before(entry.expiresAt) {
+		cachedHw = entry.info
+	} else {
+		var hwParts []string
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		if names, err := net.DefaultResolver.LookupAddr(ctx, host); err == nil && len(names) > 0 {
+			hName := strings.TrimSuffix(names[0], ".")
+			if hName != "" && hName != host {
+				hwParts = append(hwParts, "主机名:"+hName)
+			}
+		}
+		cancel()
+
+		if mac := lookupMacFromARP(host); mac != "" {
+			hwParts = append(hwParts, "MAC:"+mac)
+		}
+
+		cachedHw = strings.Join(hwParts, " | ")
+		hostInfoCacheMu.Lock()
+		if len(hostInfoCache) > 256 {
+			for k, v := range hostInfoCache {
+				if now.After(v.expiresAt) {
+					delete(hostInfoCache, k)
+				}
+			}
+		}
+		hostInfoCache[host] = hwCacheEntry{
+			info:      cachedHw,
+			expiresAt: now.Add(5 * time.Minute),
+		}
+		hostInfoCacheMu.Unlock()
+	}
+
+	uaInfo := parseShortUA(r.UserAgent())
+
+	res := host
+	if cachedHw != "" {
+		res += " [" + cachedHw + "]"
+	}
+	if uaInfo != "" {
+		res += " (" + uaInfo + ")"
+	}
+	return res
 }
 
 func writeAudit(r *http.Request, action, target, detail string) {
-	ip := getClientIP(r)
+	source := getClientFullIdentity(r)
 	_, _ = db.Exec(`INSERT INTO audit_logs (action, target_info, detail, client_ip, created_at) VALUES (?, ?, ?, ?, ?)`,
-		action, target, detail, ip, nowStr())
+		action, target, detail, source, nowStr())
 }
 
 func recordRecipient(name string) {
@@ -1432,7 +1555,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		SELECT cl.id, cl.ledger_year, cl.seq_num, cl.serial_no, cl.item_id,
 		       i.item_code, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, i.is_deleted,
 		       cl.tx_type, cl.tx_date, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price,
-		       cl.recipient, cl.remark, cl.created_at
+		       cl.recipient, cl.remark, cl.client_source, cl.created_at
 		FROM consumable_ledger cl
 		JOIN items i ON cl.item_id = i.id
 		ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`
@@ -1447,7 +1570,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			id, lYear, seqNum, itID, pSize, bQty                    int64
 			isDeleted                                               int
 			serialNo, itCode, cat, name, bUnit, pUnit, tType, tDate string
-			recip, rmk, createdAt                                   string
+			recip, rmk, clientSrc, createdAt                        string
 			pQty, totAmt, uPrice                                    float64
 		}
 		var rawList []rawLedgerRow
@@ -1458,7 +1581,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			if err := rows.Scan(&rItem.id, &rItem.lYear, &rItem.seqNum, &rItem.serialNo, &rItem.itID,
 				&rItem.itCode, &rItem.cat, &rItem.name, &rItem.bUnit, &rItem.pUnit, &rItem.pSize, &rItem.isDeleted,
 				&rItem.tType, &rItem.tDate, &rItem.bQty, &rItem.pQty, &rItem.totAmt, &rItem.uPrice,
-				&rItem.recip, &rItem.rmk, &rItem.createdAt); err == nil {
+				&rItem.recip, &rItem.rmk, &rItem.clientSrc, &rItem.createdAt); err == nil {
 				rawList = append(rawList, rItem)
 				distinctItems[rItem.itID] = true
 			}
@@ -1530,33 +1653,34 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			}
 
 			list = append(list, map[string]interface{}{
-				"id":           rItem.id,
-				"ledger_year":  rItem.lYear,
-				"seq_num":      rItem.seqNum,
-				"serial_no":    rItem.serialNo,
-				"item_id":      rItem.itID,
-				"item_code":    rItem.itCode,
-				"category":     rItem.cat,
-				"item_name":    rItem.name,
-				"is_archived":  rItem.isDeleted == 1,
-				"base_unit":    rItem.bUnit,
-				"pack_unit":    rItem.pUnit,
-				"pack_size":    rItem.pSize,
-				"pack_spec":    spec,
-				"tx_type":      rItem.tType,
-				"tx_date":      rItem.tDate,
-				"before_qty":   det.BeforeQty,
-				"base_qty":     rItem.bQty,
-				"after_qty":    det.AfterQty,
-				"pack_qty":     rItem.pQty,
-				"total_amount": rItem.totAmt,
-				"out_amount":   outCost,
-				"unit_price":   round2(effUnitPrice),
-				"recipient":    rItem.recip,
-				"remark":       rItem.rmk,
-				"date_anomaly": hasAnomaly,
-				"anomaly_msg":  aMsg,
-				"created_at":   rItem.createdAt,
+				"id":            rItem.id,
+				"ledger_year":   rItem.lYear,
+				"seq_num":       rItem.seqNum,
+				"serial_no":     rItem.serialNo,
+				"item_id":       rItem.itID,
+				"item_code":     rItem.itCode,
+				"category":      rItem.cat,
+				"item_name":     rItem.name,
+				"is_archived":   rItem.isDeleted == 1,
+				"base_unit":     rItem.bUnit,
+				"pack_unit":     rItem.pUnit,
+				"pack_size":     rItem.pSize,
+				"pack_spec":     spec,
+				"tx_type":       rItem.tType,
+				"tx_date":       rItem.tDate,
+				"before_qty":    det.BeforeQty,
+				"base_qty":      rItem.bQty,
+				"after_qty":     det.AfterQty,
+				"pack_qty":      rItem.pQty,
+				"total_amount":  rItem.totAmt,
+				"out_amount":    outCost,
+				"unit_price":    round2(effUnitPrice),
+				"recipient":     rItem.recip,
+				"remark":        rItem.rmk,
+				"client_source": rItem.clientSrc,
+				"date_anomaly":  hasAnomaly,
+				"anomaly_msg":   aMsg,
+				"created_at":    rItem.createdAt,
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
@@ -1690,11 +1814,12 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		defer tx.Rollback()
 
 		now := nowStr()
+		clientSource := getClientFullIdentity(r)
 		tmpSerial := fmt.Sprintf("INIT-TMP-%d", time.Now().UnixNano())
 		res, err := tx.Exec(`
-			INSERT INTO consumable_ledger (ledger_year, seq_num, serial_no, item_id, tx_type, tx_date, base_qty, pack_qty, total_amount, unit_price, recipient, remark, created_at, updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			yearPart, desiredSeq, tmpSerial, req.ItemID, req.TxType, req.TxDate, intBaseQty, initPackQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), now, now)
+			INSERT INTO consumable_ledger (ledger_year, seq_num, serial_no, item_id, tx_type, tx_date, base_qty, pack_qty, total_amount, unit_price, recipient, remark, client_source, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			yearPart, desiredSeq, tmpSerial, req.ItemID, req.TxType, req.TxDate, intBaseQty, initPackQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), clientSource, now, now)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
@@ -1803,11 +1928,11 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 
 	var itemID int64
 	var oldYear, oldSeq int
-	var oldSerialNo, txType, oldDate, oldRecip string
+	var oldSerialNo, txType, oldDate, oldRecip, oldClientSource string
 	var oldQty int64
 	var oldAmt float64
-	err = db.QueryRow(`SELECT item_id, ledger_year, seq_num, serial_no, tx_type, tx_date, base_qty, total_amount, recipient FROM consumable_ledger WHERE id = ?`, ledgerID).
-		Scan(&itemID, &oldYear, &oldSeq, &oldSerialNo, &txType, &oldDate, &oldQty, &oldAmt, &oldRecip)
+	err = db.QueryRow(`SELECT item_id, ledger_year, seq_num, serial_no, tx_type, tx_date, base_qty, total_amount, recipient, client_source FROM consumable_ledger WHERE id = ?`, ledgerID).
+		Scan(&itemID, &oldYear, &oldSeq, &oldSerialNo, &txType, &oldDate, &oldQty, &oldAmt, &oldRecip, &oldClientSource)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]interface{}{"success": false, "message": "流水记录不存在"})
 		return
@@ -1845,8 +1970,9 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	_, err = tx.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, pack_qty = ?, total_amount = ?, unit_price = ?, recipient = ?, remark = ?, updated_at = ? WHERE id = ?`,
-		targetYear, req.TxDate, intBaseQty, packQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), nowStr(), ledgerID)
+	newClientSource := getClientFullIdentity(r)
+	_, err = tx.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, pack_qty = ?, total_amount = ?, unit_price = ?, recipient = ?, remark = ?, client_source = ?, updated_at = ? WHERE id = ?`,
+		targetYear, req.TxDate, intBaseQty, packQty, round2(req.TotalAmount), unitPrice, strings.TrimSpace(req.Recipient), strings.TrimSpace(req.Remark), newClientSource, nowStr(), ledgerID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
@@ -1884,8 +2010,8 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 			if txType == "IN" && oldAmt > 0 && oldQty > 0 {
 				oldUnit = round4(oldAmt / float64(oldQty))
 			}
-			_, _ = txRevert.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, total_amount = ?, unit_price = ?, recipient = ? WHERE id = ?`,
-				oldYear, oldDate, oldQty, oldAmt, oldUnit, oldRecip, ledgerID)
+			_, _ = txRevert.Exec(`UPDATE consumable_ledger SET ledger_year = ?, tx_date = ?, base_qty = ?, total_amount = ?, unit_price = ?, recipient = ?, client_source = ? WHERE id = ?`,
+				oldYear, oldDate, oldQty, oldAmt, oldUnit, oldRecip, oldClientSource, ledgerID)
 			if targetYear != oldYear {
 				_, _ = resequenceConsumableYear(txRevert, targetYear, 0, 0)
 			}
@@ -2082,7 +2208,6 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 仅统计总金额 > 0 且单价 > 0 的有效采购记录，价格为 0 的划拨物资不纳入价格分布与合理区间
 	rows, err := db.Query(`
 		SELECT tx_date, base_qty, total_amount, unit_price
 		FROM consumable_ledger
@@ -3100,7 +3225,7 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 }
 
-// ==================== 11. Excel 专业导出（含审计日志导出） ====================
+// ==================== 11. Excel 专业导出（含完整终端溯源指纹：IP + 主机名 + MAC + 终端环境） ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
@@ -3219,7 +3344,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "系统敏感操作与数据变更审计追踪记录"
 		}
-		headers := []string{"操作时间", "操作来源 IP", "操作类型", "操作对象", "变更前后详情"}
+		headers := []string{"操作时间", "操作来源终端 (IP / 主机名 / MAC / 环境)", "操作类型", "操作对象", "变更前后详情"}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出时间：%s", customOrg, nowStr()), len(headers), false)
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
@@ -3227,7 +3352,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
 		_ = f.SetColWidth(sheet, "A", "A", 20)
-		_ = f.SetColWidth(sheet, "B", "B", 22)
+		_ = f.SetColWidth(sheet, "B", "B", 44)
 		_ = f.SetColWidth(sheet, "C", "C", 24)
 		_ = f.SetColWidth(sheet, "D", "D", 24)
 		_ = f.SetColWidth(sheet, "E", "E", 58)
@@ -3256,7 +3381,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		if customTitle == "" {
 			customTitle = "办公消耗品入库与领用接续流水账"
 		}
-		headers := []string{"流水编号", "登记日期", "用品编码", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注"}
+		headers := []string{"流水编号", "登记日期", "用品编码", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注", "操作来源终端 (IP / 主机名 / MAC / 环境)"}
 		moneyCols := map[int]bool{13: true, 14: true}
 		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers), true)
 		for i, h := range headers {
@@ -3264,23 +3389,25 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			_ = f.SetCellValue(sheet, cell, h)
 			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
 		}
+		_ = f.SetColWidth(sheet, "R", "R", 42)
+
 		rows, _ := db.Query(`
-			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.item_code, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, cl.tx_type, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price, cl.recipient, cl.remark
+			SELECT cl.id, cl.item_id, cl.serial_no, cl.tx_date, i.item_code, i.category, i.name, i.base_unit, i.pack_unit, i.pack_size, cl.tx_type, cl.base_qty, cl.pack_qty, cl.total_amount, cl.unit_price, cl.recipient, cl.remark, cl.client_source
 			FROM consumable_ledger cl JOIN items i ON cl.item_id = i.id
 			WHERE cl.tx_date >= ? AND cl.tx_date <= ?
 			ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`, startDate, endDate)
 
 		type expLedger struct {
-			id, itID, bQty, pSize                                          int64
-			sNo, tDate, itCode, cat, name, bUnit, pUnit, tType, recip, rmk string
-			pQty, tAmt, uPrice                                             float64
+			id, itID, bQty, pSize                                                     int64
+			sNo, tDate, itCode, cat, name, bUnit, pUnit, tType, recip, rmk, clientSrc string
+			pQty, tAmt, uPrice                                                        float64
 		}
 		var list []expLedger
 		itemsSet := make(map[int64]bool)
 		if rows != nil {
 			for rows.Next() {
 				var e expLedger
-				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.itCode, &e.cat, &e.name, &e.bUnit, &e.pUnit, &e.pSize, &e.tType, &e.bQty, &e.pQty, &e.tAmt, &e.uPrice, &e.recip, &e.rmk); err == nil {
+				if err := rows.Scan(&e.id, &e.itID, &e.sNo, &e.tDate, &e.itCode, &e.cat, &e.name, &e.bUnit, &e.pUnit, &e.pSize, &e.tType, &e.bQty, &e.pQty, &e.tAmt, &e.uPrice, &e.recip, &e.rmk, &e.clientSrc); err == nil {
 					list = append(list, e)
 					itemsSet[e.itID] = true
 				}
@@ -3310,7 +3437,11 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			if e.pUnit == "" {
 				spec = fmt.Sprintf("1%s", e.bUnit)
 			}
-			vals := []interface{}{e.sNo, e.tDate, e.itCode, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, det.BeforeQty, e.bQty, det.AfterQty, e.pQty, amtShow, unitShow, e.recip, e.rmk}
+			srcDisplay := e.clientSrc
+			if strings.TrimSpace(srcDisplay) == "" {
+				srcDisplay = "本机/历史记录"
+			}
+			vals := []interface{}{e.sNo, e.tDate, e.itCode, e.cat, e.name, e.bUnit, e.pUnit, spec, typeZh, det.BeforeQty, e.bQty, det.AfterQty, e.pQty, amtShow, unitShow, e.recip, e.rmk, srcDisplay}
 			for cIdx, v := range vals {
 				cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
 				_ = f.SetCellValue(sheet, cell, v)
@@ -3643,7 +3774,7 @@ func buildTrayIconBytes() []byte {
 			if inBox && !isCorner {
 				r, g, b, a = 37, 99, 235, 255
 				if y >= 6 && y <= 8 && x >= 7 && x <= 24 {
-					r, g, b = 147, 197, 253
+					r, g, b = 147, 197, 235
 				}
 				if (y >= 12 && y <= 13 && x >= 7 && x <= 24) ||
 					(y >= 17 && y <= 18 && x >= 7 && x <= 24) ||
