@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -39,12 +40,13 @@ var embeddedWebFS embed.FS
 // ==================== 1. 全局配置与目录初始化 ====================
 
 type AppConfig struct {
-	Port          int    `json:"port"`
-	AdminPasscode string `json:"admin_passcode"`
-	EntryPasscode string `json:"entry_passcode"`
-	AllowLan      bool   `json:"allow_lan"`
-	SecretSalt    string `json:"secret_salt"`
-	OrgName       string `json:"org_name"`
+	Port             int     `json:"port"`
+	AdminPasscode    string  `json:"admin_passcode"`
+	EntryPasscode    string  `json:"entry_passcode"`
+	AllowLan         bool    `json:"allow_lan"`
+	SecretSalt       string  `json:"secret_salt"`
+	OrgName          string  `json:"org_name"`
+	TokenExpireHours float64 `json:"token_expire_hours"`
 }
 
 var (
@@ -53,13 +55,15 @@ var (
 	configPath    string
 	attachRootDir string
 	backupDir     string
+	lockFilePath  string
 
-	appCfg      AppConfig
-	cfgMutex    sync.RWMutex
-	db          *sql.DB
-	httpSrv     *http.Server
-	srvMutex    sync.Mutex
-	currentPort int
+	appCfg           AppConfig
+	cfgMutex         sync.RWMutex
+	ledgerWriteMutex sync.Mutex
+	db               *sql.DB
+	httpSrv          *http.Server
+	srvMutex         sync.Mutex
+	currentPort      int
 )
 
 func resolveDataRoot() string {
@@ -80,6 +84,7 @@ func initDirectoriesAndConfig() error {
 	configPath = filepath.Join(dataRootDir, "config.json")
 	attachRootDir = filepath.Join(dataRootDir, "attachments")
 	backupDir = filepath.Join(dataRootDir, "backups")
+	lockFilePath = filepath.Join(dataRootDir, ".instance.lock")
 
 	subDirs := []string{
 		dataRootDir,
@@ -96,16 +101,19 @@ func initDirectoriesAndConfig() error {
 		}
 	}
 
+	cleanupTempGarbage()
+
 	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
 		saltBytes := make([]byte, 16)
 		_, _ = rand.Read(saltBytes)
 		appCfg = AppConfig{
-			Port:          8088,
-			AdminPasscode: "888888",
-			EntryPasscode: "666666",
-			AllowLan:      true,
-			SecretSalt:    hex.EncodeToString(saltBytes),
-			OrgName:       "综合行政部",
+			Port:             8088,
+			AdminPasscode:    "888888",
+			EntryPasscode:    "666666",
+			AllowLan:         true,
+			SecretSalt:       hex.EncodeToString(saltBytes),
+			OrgName:          "综合行政部",
+			TokenExpireHours: 4,
 		}
 		return saveConfigToFile()
 	}
@@ -117,19 +125,42 @@ func initDirectoriesAndConfig() error {
 	if err := json.Unmarshal(raw, &appCfg); err != nil {
 		return err
 	}
+	needSave := false
 	if appCfg.Port <= 0 || appCfg.Port > 65535 {
 		appCfg.Port = 8088
+		needSave = true
 	}
 	if strings.TrimSpace(appCfg.OrgName) == "" {
 		appCfg.OrgName = "综合行政部"
+		needSave = true
+	}
+	if appCfg.TokenExpireHours <= 0 {
+		appCfg.TokenExpireHours = 4
+		needSave = true
 	}
 	if appCfg.SecretSalt == "" {
 		saltBytes := make([]byte, 16)
 		_, _ = rand.Read(saltBytes)
 		appCfg.SecretSalt = hex.EncodeToString(saltBytes)
+		needSave = true
+	}
+	if needSave {
 		_ = saveConfigToFile()
 	}
 	return nil
+}
+
+func cleanupTempGarbage() {
+	_ = os.Remove(configPath + ".tmp")
+	tempExportDir := filepath.Join(attachRootDir, "4_导出报表暂存")
+	if entries, err := os.ReadDir(tempExportDir); err == nil {
+		cutoff := time.Now().Add(-24 * time.Hour)
+		for _, entry := range entries {
+			if info, err := entry.Info(); err == nil && !info.IsDir() && info.ModTime().Before(cutoff) {
+				_ = os.Remove(filepath.Join(tempExportDir, entry.Name()))
+			}
+		}
+	}
 }
 
 func saveConfigToFile() error {
@@ -144,6 +175,53 @@ func saveConfigToFile() error {
 		return err
 	}
 	return os.Rename(tmpPath, configPath)
+}
+
+// ==================== 单实例运行守卫 ====================
+
+type instanceLockInfo struct {
+	PID  int `json:"pid"`
+	Port int `json:"port"`
+}
+
+func checkAndAcquireSingleInstance(defaultPort int) (alreadyRunning bool, runningPort int) {
+	if raw, err := os.ReadFile(lockFilePath); err == nil {
+		var info instanceLockInfo
+		if json.Unmarshal(raw, &info) == nil && info.Port > 0 {
+			client := &http.Client{Timeout: 800 * time.Millisecond}
+			resp, errReq := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/instance/ping", info.Port))
+			if errReq == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return true, info.Port
+				}
+			}
+		}
+	}
+	client := &http.Client{Timeout: 600 * time.Millisecond}
+	if resp, errReq := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/instance/ping", defaultPort)); errReq == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return true, defaultPort
+		}
+	}
+	return false, 0
+}
+
+func writeInstanceLockFile(port int) {
+	info := instanceLockInfo{PID: os.Getpid(), Port: port}
+	if b, err := json.Marshal(info); err == nil {
+		_ = os.WriteFile(lockFilePath, b, 0600)
+	}
+}
+
+func removeInstanceLockFile() {
+	if raw, err := os.ReadFile(lockFilePath); err == nil {
+		var info instanceLockInfo
+		if json.Unmarshal(raw, &info) == nil && info.PID == os.Getpid() {
+			_ = os.Remove(lockFilePath)
+		}
+	}
 }
 
 // ==================== 2. 数据库初始化与预置字典 ====================
@@ -264,6 +342,7 @@ func initDatabase() error {
 		action TEXT NOT NULL,
 		target_info TEXT NOT NULL,
 		detail TEXT NOT NULL,
+		client_ip TEXT NOT NULL DEFAULT '127.0.0.1',
 		created_at TEXT NOT NULL
 	);
 	`
@@ -275,6 +354,7 @@ func initDatabase() error {
 	_, _ = db.Exec(`ALTER TABLE annual_carryover ADD COLUMN closing_value REAL NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0`)
 	_, _ = db.Exec(`ALTER TABLE items ADD COLUMN item_code TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE audit_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT '127.0.0.1'`)
 
 	seedDefaultItems()
 	ensureAllItemCodes()
@@ -431,8 +511,24 @@ func sanitizeToken(s string) string {
 	return res
 }
 
-func writeAudit(action, target, detail string) {
-	_, _ = db.Exec(`INSERT INTO audit_logs (action, target_info, detail, created_at) VALUES (?, ?, ?, ?)`, action, target, detail, nowStr())
+func getClientIP(r *http.Request) string {
+	if r == nil {
+		return "系统内部"
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if host == "127.0.0.1" || host == "::1" {
+		return "127.0.0.1 (主机本机)"
+	}
+	return host
+}
+
+func writeAudit(r *http.Request, action, target, detail string) {
+	ip := getClientIP(r)
+	_, _ = db.Exec(`INSERT INTO audit_logs (action, target_info, detail, client_ip, created_at) VALUES (?, ?, ?, ?, ?)`,
+		action, target, detail, ip, nowStr())
 }
 
 func recordRecipient(name string) {
@@ -757,12 +853,17 @@ func verifyRoleToken(token string) (string, bool) {
 	}
 	role, tsStr, sig := parts[0], parts[1], parts[2]
 	ts, err := strconv.ParseInt(tsStr, 10, 64)
-	if err != nil || time.Now().Unix()-ts > 16*3600 {
-		return "", false
-	}
 	cfgMutex.RLock()
 	salt := appCfg.SecretSalt
+	expireHours := appCfg.TokenExpireHours
 	cfgMutex.RUnlock()
+	if expireHours <= 0 {
+		expireHours = 4
+	}
+	maxAgeSec := int64(expireHours * 3600)
+	if err != nil || time.Now().Unix()-ts > maxAgeSec {
+		return "", false
+	}
 	mac := hmac.New(sha256.New, []byte(salt))
 	mac.Write([]byte(role + "|" + tsStr))
 	expected := hex.EncodeToString(mac.Sum(nil))
@@ -808,7 +909,7 @@ func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// 附件查看与下载：只要开启了局域网访问（或本机访问），直接放行，无需再弹窗输口令
+		// 附件查看与下载：只要开启了局域网访问或本机访问直接放行
 		if strings.HasPrefix(path, "/attachments/") {
 			if !isLocalRequest(r) {
 				cfgMutex.RLock()
@@ -827,7 +928,7 @@ func authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if path == "/api/auth/status" || path == "/api/auth/login" {
+		if path == "/api/auth/status" || path == "/api/auth/login" || path == "/api/instance/ping" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -841,7 +942,7 @@ func authMiddleware(next http.Handler) http.Handler {
 				writeJSON(w, http.StatusForbidden, map[string]interface{}{"success": false, "message": "主机已关闭内网外部访问"})
 				return
 			}
-			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"success": false, "locked": true, "message": "请输入内网访问口令"})
+			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"success": false, "locked": true, "message": "登录已过期或未验证，请输入访问口令"})
 			return
 		}
 
@@ -861,7 +962,14 @@ func authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ==================== 5. 鉴权与系统设置接口 ====================
+// ==================== 5. 鉴权、单实例唤起与系统设置接口 ====================
+
+func handleInstancePing(w http.ResponseWriter, r *http.Request) {
+	if isLocalRequest(r) && r.URL.Query().Get("wake") == "1" {
+		go openBrowser(fmt.Sprintf("http://127.0.0.1:%d", currentPort))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "pid": os.Getpid(), "port": currentPort})
+}
 
 func getLanIPs() []string {
 	var ips []string
@@ -904,14 +1012,15 @@ func handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"success":       true,
-		"is_localhost":  isLocal,
-		"role":          role,
-		"authenticated": role == "admin" || role == "entry",
-		"port":          port,
-		"lan_urls":      urls,
-		"allow_lan":     cfgCopy.AllowLan,
-		"org_name":      cfgCopy.OrgName,
+		"success":            true,
+		"is_localhost":       isLocal,
+		"role":               role,
+		"authenticated":      role == "admin" || role == "entry",
+		"port":               port,
+		"lan_urls":           urls,
+		"allow_lan":          cfgCopy.AllowLan,
+		"org_name":           cfgCopy.OrgName,
+		"token_expire_hours": cfgCopy.TokenExpireHours,
 	}
 	if isLocal {
 		resp["admin_passcode"] = cfgCopy.AdminPasscode
@@ -965,11 +1074,12 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		Port          int    `json:"port"`
-		AdminPasscode string `json:"admin_passcode"`
-		EntryPasscode string `json:"entry_passcode"`
-		AllowLan      bool   `json:"allow_lan"`
-		OrgName       string `json:"org_name"`
+		Port             int     `json:"port"`
+		AdminPasscode    string  `json:"admin_passcode"`
+		EntryPasscode    string  `json:"entry_passcode"`
+		AllowLan         bool    `json:"allow_lan"`
+		OrgName          string  `json:"org_name"`
+		TokenExpireHours float64 `json:"token_expire_hours"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "参数格式错误"})
@@ -977,6 +1087,10 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Port < 1024 || req.Port > 65535 {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "端口范围必须在 1024 ~ 65535 之间"})
+		return
+	}
+	if req.TokenExpireHours <= 0 || req.TokenExpireHours > 720 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "密码有效时限必须在 0.1 ~ 720 小时之间"})
 		return
 	}
 	if strings.TrimSpace(req.AdminPasscode) == "" || strings.TrimSpace(req.EntryPasscode) == "" {
@@ -994,6 +1108,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	appCfg.AdminPasscode = strings.TrimSpace(req.AdminPasscode)
 	appCfg.EntryPasscode = strings.TrimSpace(req.EntryPasscode)
 	appCfg.AllowLan = req.AllowLan
+	appCfg.TokenExpireHours = req.TokenExpireHours
 	if strings.TrimSpace(req.OrgName) != "" {
 		appCfg.OrgName = strings.TrimSpace(req.OrgName)
 	}
@@ -1003,6 +1118,9 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 		return
 	}
+
+	writeAudit(r, "修改系统设置", fmt.Sprintf("端口:%d", req.Port),
+		fmt.Sprintf("局域网访问:%v, 密码时限:%.1f小时, 单位:%s", req.AllowLan, req.TokenExpireHours, appCfg.OrgName))
 
 	needRestart := oldPort != req.Port && req.Port != currentPort
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -1020,7 +1138,7 @@ func handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ==================== 6. 用品库管理（专有编码隔离 + 防重 + 修改数量守恒折算 + 零结存归档删除） ====================
+// ==================== 6. 用品库管理 ====================
 
 type ItemDTO struct {
 	ID         int64   `json:"id"`
@@ -1131,7 +1249,6 @@ func handleItems(w http.ResponseWriter, r *http.Request) {
 			req.PackSize = 1
 		}
 
-		// 仅与当前启用中（is_deleted = 0）的用品比对重名；已停用归档的旧规格用品不阻断新规格建档
 		var exists int
 		_ = db.QueryRow(`SELECT COUNT(1) FROM items WHERE category = ? AND nature = ? AND name = ? AND is_deleted = 0`, req.Category, req.Nature, req.Name).Scan(&exists)
 		if exists > 0 {
@@ -1182,7 +1299,6 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 安全前置校验：必须当前库存归零（无在库/在用物资）才允许删除，防止未用完误删
 		if nature == "consumable" {
 			snap, _ := replayConsumableMovingAvg(itemID, "", "")
 			if snap.StockQty > 0 {
@@ -1213,7 +1329,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 				return
 			}
-			writeAudit("删除用品库条目(保留历史账目)", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name),
+			writeAudit(r, "删除用品库条目(保留历史账目)", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name),
 				fmt.Sprintf("已确认当前结存为0，从用品库停用移除；原有 %d 条历史流水及 %d 条资产履历完整封存保留", ledgerCnt, assetCnt))
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"success": true,
@@ -1227,7 +1343,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
-		writeAudit("删除用品库条目", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name), fmt.Sprintf("性质：%s，无历史业务记录，已清理", natureLabel(nature)))
+		writeAudit(r, "删除用品库条目", fmt.Sprintf("%s (%s/%s)", itemCode, cat, name), fmt.Sprintf("性质：%s，无历史业务记录，已清理", natureLabel(nature)))
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("已从用品库中删除【%s %s】", itemCode, name)})
 		return
 	}
@@ -1287,7 +1403,7 @@ func handleItemByID(w http.ResponseWriter, r *http.Request) {
 
 	reconcileItemPackQuantities(itemID)
 
-	writeAudit("修改用品库信息", fmt.Sprintf("%s (%s)", itemCode, req.Name),
+	writeAudit(r, "修改用品库信息", fmt.Sprintf("%s (%s)", itemCode, req.Name),
 		fmt.Sprintf("原[%s/%s, 包装规格:%d] -> 新[%s/%s, 包装规格:%d]，已按基本数量重算折算包装数量", oldCat, oldName, oldPackSize, req.Category, req.Name, req.PackSize))
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "用品库信息已修改，历史台账折算包装数量已按基本数量重新计算"})
@@ -1328,11 +1444,11 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		}
 
 		type rawLedgerRow struct {
-			id, lYear, seqNum, itID, pSize, bQty                          int64
-			isDeleted                                                     int
-			serialNo, itCode, cat, name, bUnit, pUnit, tType, tDate       string
-			recip, rmk, createdAt                                         string
-			pQty, totAmt, uPrice                                          float64
+			id, lYear, seqNum, itID, pSize, bQty                    int64
+			isDeleted                                               int
+			serialNo, itCode, cat, name, bUnit, pUnit, tType, tDate string
+			recip, rmk, createdAt                                   string
+			pQty, totAmt, uPrice                                    float64
 		}
 		var rawList []rawLedgerRow
 		distinctItems := make(map[int64]bool)
@@ -1466,7 +1582,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			req.TxDate = todayStr()
 		}
 		if req.BaseQty <= 0 || math.Abs(req.BaseQty-math.Round(req.BaseQty)) > 0.0001 {
-			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "入库/领用数量必须为大于 0 的整数（最小计量单位不可取小数）"})
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "数量必须为大于 0 的整数"})
 			return
 		}
 		intBaseQty := int64(math.Round(req.BaseQty))
@@ -1475,6 +1591,9 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "操作类型必须为入库(IN)或领用(OUT)"})
 			return
 		}
+
+		ledgerWriteMutex.Lock()
+		defer ledgerWriteMutex.Unlock()
 
 		var nature string
 		var packSize int64
@@ -1621,7 +1740,7 @@ func handleConsumableLedger(w http.ResponseWriter, r *http.Request) {
 		_ = db.QueryRow(`SELECT pack_qty FROM consumable_ledger WHERE id = ?`, newID).Scan(&finalPackQty)
 
 		if isBackdate {
-			writeAudit("特权补录/插号登记流水", finalSerialNo, fmt.Sprintf("单据日期:%s, 数量:%d, 原因:%s", req.TxDate, intBaseQty, backdateReason))
+			writeAudit(r, "特权补录/插号登记流水", finalSerialNo, fmt.Sprintf("单据日期:%s, 数量:%d, 原因:%s", req.TxDate, intBaseQty, backdateReason))
 		}
 
 		if req.TxType == "IN" {
@@ -1674,10 +1793,13 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.BaseQty <= 0 || math.Abs(req.BaseQty-math.Round(req.BaseQty)) > 0.0001 {
-		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "入库/领用数量必须为正整数"})
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "数量必须为正整数"})
 		return
 	}
 	intBaseQty := int64(math.Round(req.BaseQty))
+
+	ledgerWriteMutex.Lock()
+	defer ledgerWriteMutex.Unlock()
 
 	var itemID int64
 	var oldYear, oldSeq int
@@ -1782,11 +1904,11 @@ func handleConsumableLedgerByID(w http.ResponseWriter, r *http.Request) {
 		recordRecipient(req.Recipient)
 	}
 
-	writeAudit("修正消耗品流水记录", finalSerialNo, fmt.Sprintf("原[编号:%s, 日期:%s, 数量:%d, 金额:%g] -> 新[编号:%s, 日期:%s, 数量:%d, 金额:%g]", oldSerialNo, oldDate, oldQty, oldAmt, finalSerialNo, req.TxDate, intBaseQty, req.TotalAmount))
+	writeAudit(r, "修正消耗品流水记录", finalSerialNo, fmt.Sprintf("原[编号:%s, 日期:%s, 数量:%d, 金额:%g] -> 新[编号:%s, 日期:%s, 数量:%d, 金额:%g]", oldSerialNo, oldDate, oldQty, oldAmt, finalSerialNo, req.TxDate, intBaseQty, req.TotalAmount))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "serial_no": finalSerialNo, "message": "流水记录已修正，全年度序号已连续重排并闭合"})
 }
 
-// ==================== 8. 会计级期初/期末盘点（支持专有编码区分新旧规格） ====================
+// ==================== 8. 会计级期初/期末盘点 ====================
 
 type consumableBaseInfo struct {
 	ID        int64
@@ -1944,7 +2066,7 @@ func formatPriceRange(minP, maxP float64) string {
 	return fmt.Sprintf("%.2f ~ %.2f", minP, maxP)
 }
 
-// ==================== 8.5 采购价格正态/频率分布直方图分析接口 ====================
+// ==================== 8.5 采购价格正态/频率分布直方图分析接口（自动剔除价格为0的无价划拨记录） ====================
 
 func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 	itemIDStr := r.URL.Query().Get("item_id")
@@ -1960,10 +2082,11 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 仅统计总金额 > 0 且单价 > 0 的有效采购记录，价格为 0 的划拨物资不纳入价格分布与合理区间
 	rows, err := db.Query(`
 		SELECT tx_date, base_qty, total_amount, unit_price
 		FROM consumable_ledger
-		WHERE item_id = ? AND tx_type = 'IN' AND unit_price > 0
+		WHERE item_id = ? AND tx_type = 'IN' AND total_amount > 0 AND unit_price > 0
 		ORDER BY unit_price ASC`, itemID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
@@ -1985,6 +2108,9 @@ func handleItemPriceDistribution(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rec priceRecord
 		if err := rows.Scan(&rec.Date, &rec.Qty, &rec.TotalAmt, &rec.UnitPrice); err == nil {
+			if rec.UnitPrice <= 0 || rec.TotalAmt <= 0 {
+				continue
+			}
 			records = append(records, rec)
 			prices = append(prices, rec.UnitPrice)
 			weightedSum += rec.TotalAmt
@@ -2137,7 +2263,7 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
-		writeAudit("取消年度结转", fmt.Sprintf("%d年度", carryYear), "管理员已撤销该年度结转锁定快照")
+		writeAudit(r, "取消年度结转", fmt.Sprintf("%d年度", carryYear), "管理员已撤销该年度结转锁定快照")
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": fmt.Sprintf("已成功取消 %d 年度结转记录，系统已重新计算连续期初与在库余值。", carryYear),
@@ -2222,7 +2348,7 @@ func handleAnnualCarryover(w http.ResponseWriter, r *http.Request) {
 	_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE status = '闲置'`).Scan(&idleCnt)
 	_ = db.QueryRow(`SELECT COUNT(1) FROM reusable_assets WHERE status = '报废'`).Scan(&scrapCnt)
 
-	writeAudit("执行年度结转", fmt.Sprintf("%d年度", req.CarryYear),
+	writeAudit(r, "执行年度结转", fmt.Sprintf("%d年度", req.CarryYear),
 		fmt.Sprintf("消耗品共结转 %d 个品种至 %d-01-01 期初；复用品类资产快照：在用 %d 件、闲置 %d 件、已报废 %d 件", len(itemIDs), req.CarryYear+1, inUseCnt, idleCnt, scrapCnt))
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2418,7 +2544,7 @@ func handleReusableAssets(w http.ResponseWriter, r *http.Request) {
 		var isDeleted int
 		err := db.QueryRow(`SELECT category, name, nature, is_deleted FROM items WHERE id = ?`, itemID).Scan(&cat, &itName, &nature, &isDeleted)
 		if err != nil || nature != "reusable" || isDeleted == 1 {
-			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "请选择有效的复用品(类资产)品名"})
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "message": "请选择有效的复用品品名"})
 			return
 		}
 
@@ -2607,7 +2733,7 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 		if newItemID != oldItemID {
 			recalculateItemPriceRange(newItemID)
 		}
-		writeAudit("修正复用品档案", assetNo, detailStr)
+		writeAudit(r, "修正复用品档案", assetNo, detailStr)
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "类资产档案与金额/日期信息已更新"})
 		return
 	}
@@ -2682,7 +2808,7 @@ func handleReusableAssetAction(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 				return
 			}
-			writeAudit("取消复用品报废", assetNo, fmt.Sprintf("品名:%s, 恢复为闲置状态。%s", itName, remark))
+			writeAudit(r, "取消复用品报废", assetNo, fmt.Sprintf("品名:%s, 恢复为闲置状态。%s", itName, remark))
 			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "log_no": logNo, "message": "已取消报废并恢复为闲置可用状态"})
 			return
 		}
@@ -2916,7 +3042,7 @@ func handleMonthlyAttachmentByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "message": err.Error()})
 			return
 		}
-		writeAudit("修改月度附件信息", fmt.Sprintf("ID=%d", attID), fmt.Sprintf("月份:%s, 标题:%s", req.YearMonth, req.Title))
+		writeAudit(r, "修改月度附件信息", fmt.Sprintf("ID=%d", attID), fmt.Sprintf("月份:%s, 标题:%s", req.YearMonth, req.Title))
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 
 	case http.MethodDelete:
@@ -2931,7 +3057,7 @@ func handleMonthlyAttachmentByID(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(absPath)
 		}
 		_, _ = db.Exec(`DELETE FROM monthly_attachments WHERE id = ?`, attID)
-		writeAudit("删除月度原始附件", title, fmt.Sprintf("ID=%d, 文件=%s", attID, fPath))
+		writeAudit(r, "删除月度原始附件", title, fmt.Sprintf("ID=%d, 文件=%s", attID, fPath))
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 
 	default:
@@ -2956,7 +3082,7 @@ func handleRecipients(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(`SELECT id, action, target_info, detail, created_at FROM audit_logs ORDER BY id DESC LIMIT 100`)
+	rows, err := db.Query(`SELECT id, action, target_info, detail, client_ip, created_at FROM audit_logs ORDER BY id DESC LIMIT 500`)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": []interface{}{}})
 		return
@@ -2965,14 +3091,16 @@ func handleAuditLogs(w http.ResponseWriter, r *http.Request) {
 	list := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var id int64
-		var act, tgt, det, cAt string
-		_ = rows.Scan(&id, &act, &tgt, &det, &cAt)
-		list = append(list, map[string]interface{}{"id": id, "action": act, "target_info": tgt, "detail": det, "created_at": cAt})
+		var act, tgt, det, ip, cAt string
+		_ = rows.Scan(&id, &act, &tgt, &det, &ip, &cAt)
+		list = append(list, map[string]interface{}{
+			"id": id, "action": act, "target_info": tgt, "detail": det, "client_ip": ip, "created_at": cAt,
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "data": list})
 }
 
-// ==================== 11. Excel 专业导出（包含专有用品编码列） ====================
+// ==================== 11. Excel 专业导出（含审计日志导出） ====================
 
 func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	mode := r.URL.Query().Get("mode")
@@ -3041,7 +3169,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	setupSheetHeader := func(sheet, title, subMeta string, colCount int) {
+	setupSheetHeader := func(sheet, title, subMeta string, colCount int, showMoneyUnit bool) {
 		endCol, _ := excelize.ColumnNumberToName(colCount)
 		midColNum := colCount - 2
 		if midColNum < 1 {
@@ -3055,14 +3183,18 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		_ = f.SetCellStyle(sheet, "A1", endCol+"1", titleStyle)
 		_ = f.SetRowHeight(sheet, 1, 28)
 
-		_ = f.MergeCell(sheet, "A2", midCol+"2")
-		_ = f.SetCellValue(sheet, "A2", subMeta)
-		_ = f.SetCellStyle(sheet, "A2", midCol+"2", metaLeftStyle)
+		if showMoneyUnit && colCount > 2 {
+			_ = f.MergeCell(sheet, "A2", midCol+"2")
+			_ = f.SetCellValue(sheet, "A2", subMeta)
+			_ = f.SetCellStyle(sheet, "A2", midCol+"2", metaLeftStyle)
 
-		if colCount > 2 {
 			_ = f.MergeCell(sheet, rightStartCol+"2", endCol+"2")
 			_ = f.SetCellValue(sheet, rightStartCol+"2", "金额单位：元")
 			_ = f.SetCellStyle(sheet, rightStartCol+"2", endCol+"2", metaRightStyle)
+		} else {
+			_ = f.MergeCell(sheet, "A2", endCol+"2")
+			_ = f.SetCellValue(sheet, "A2", subMeta)
+			_ = f.SetCellStyle(sheet, "A2", endCol+"2", metaLeftStyle)
 		}
 		_ = f.SetRowHeight(sheet, 2, 20)
 		_ = f.SetRowHeight(sheet, 3, 28)
@@ -3081,6 +3213,43 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 	fileName := "办公用品台账导出.xlsx"
 
 	switch mode {
+	case "audit_logs":
+		sheet := "敏感修改审计日志"
+		_ = f.SetSheetName("Sheet1", sheet)
+		if customTitle == "" {
+			customTitle = "系统敏感操作与数据变更审计追踪记录"
+		}
+		headers := []string{"操作时间", "操作来源 IP", "操作类型", "操作对象", "变更前后详情"}
+		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出时间：%s", customOrg, nowStr()), len(headers), false)
+		for i, h := range headers {
+			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
+			_ = f.SetCellValue(sheet, cell, h)
+			_ = f.SetCellStyle(sheet, cell, cell, headerStyle)
+		}
+		_ = f.SetColWidth(sheet, "A", "A", 20)
+		_ = f.SetColWidth(sheet, "B", "B", 22)
+		_ = f.SetColWidth(sheet, "C", "C", 24)
+		_ = f.SetColWidth(sheet, "D", "D", 24)
+		_ = f.SetColWidth(sheet, "E", "E", 58)
+
+		rows, _ := db.Query(`SELECT created_at, client_ip, action, target_info, detail FROM audit_logs ORDER BY id DESC`)
+		rIdx := 4
+		if rows != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var cAt, ip, act, tgt, det string
+				_ = rows.Scan(&cAt, &ip, &act, &tgt, &det)
+				vals := []interface{}{cAt, ip, act, tgt, det}
+				for cIdx, v := range vals {
+					cell, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx)
+					_ = f.SetCellValue(sheet, cell, v)
+					_ = f.SetCellStyle(sheet, cell, cell, centerCellStyle)
+				}
+				rIdx++
+			}
+		}
+		fileName = fmt.Sprintf("敏感修改审计日志_%s.xlsx", todayStr())
+
 	case "consumable_ledger":
 		sheet := "消耗品接续流水账"
 		_ = f.SetSheetName("Sheet1", sheet)
@@ -3089,7 +3258,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		}
 		headers := []string{"流水编号", "登记日期", "用品编码", "用品分类", "品名", "基本单位", "包装单位", "包装规格", "操作类型", "入库/领用前数量", "入库/领用数量", "入库/领用后数量", "折算包装数量", "采购/领用金额", "单价", "领用人", "备注"}
 		moneyCols := map[int]bool{13: true, 14: true}
-		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
+		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers), true)
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
 			_ = f.SetCellValue(sheet, cell, h)
@@ -3102,9 +3271,9 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			ORDER BY cl.ledger_year ASC, cl.seq_num ASC, cl.id ASC`, startDate, endDate)
 
 		type expLedger struct {
-			id, itID, bQty, pSize                                            int64
-			sNo, tDate, itCode, cat, name, bUnit, pUnit, tType, recip, rmk   string
-			pQty, tAmt, uPrice                                               float64
+			id, itID, bQty, pSize                                          int64
+			sNo, tDate, itCode, cat, name, bUnit, pUnit, tType, recip, rmk string
+			pQty, tAmt, uPrice                                             float64
 		}
 		var list []expLedger
 		itemsSet := make(map[int64]bool)
@@ -3163,7 +3332,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		}
 		headers := []string{"资产编号", "用品编码", "用品分类", "标准品名", "二级品名/位置", "购置日期", "购置单价", "预计年限(年)", "预计处置日期", "当前状态", "当前使用人", "报废日期", "备注"}
 		moneyCols := map[int]bool{6: true}
-		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出日期：%s", customOrg, todayStr()), len(headers))
+		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    导出日期：%s", customOrg, todayStr()), len(headers), true)
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
 			_ = f.SetCellValue(sheet, cell, h)
@@ -3213,7 +3382,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 		headers := []string{"流转编号", "操作日期", "流转动作", "相关人员", "详情说明", "附件路径"}
 		subInfo := fmt.Sprintf("单位：%s | 资产编号：%s | 品名：%s(%s) | 购置单价：%.2f | 预计处置：%s | 当前状态：%s",
 			customOrg, assetNo, itName, subName, round2(uPrice), calcDisposalDate(pDate, expY), st)
-		setupSheetHeader(sheet, customTitle, subInfo, len(headers))
+		setupSheetHeader(sheet, customTitle, subInfo, len(headers), true)
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
 			_ = f.SetCellValue(sheet, cell, h)
@@ -3252,7 +3421,7 @@ func handleExportExcel(w http.ResponseWriter, r *http.Request) {
 			"平均价", "当前在库价值", "采购价格分布",
 		}
 		moneyCols := map[int]bool{15: true, 16: true}
-		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers))
+		setupSheetHeader(sheet, customTitle, fmt.Sprintf("单位/部门：%s    |    统计区间：%s 至 %s", customOrg, startDate, endDate), len(headers), true)
 		for i, h := range headers {
 			cell, _ := excelize.CoordinatesToCellName(i+1, 3)
 			_ = f.SetCellValue(sheet, cell, h)
@@ -3325,6 +3494,7 @@ func boolPtr(b bool) *bool { return &b }
 func buildHTTPMux() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/api/instance/ping", handleInstancePing)
 	mux.HandleFunc("/api/auth/status", handleAuthStatus)
 	mux.HandleFunc("/api/auth/login", handleAuthLogin)
 	mux.HandleFunc("/api/settings", handleUpdateSettings)
@@ -3357,6 +3527,11 @@ func buildHTTPMux() http.Handler {
 			return
 		}
 		absPath := filepath.Join(attachRootDir, cleanRel)
+		relCheck, err := filepath.Rel(attachRootDir, absPath)
+		if err != nil || strings.HasPrefix(relCheck, "..") {
+			http.Error(w, "非法文件路径", http.StatusForbidden)
+			return
+		}
 		if r.URL.Query().Get("download") == "1" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(absPath)))
 		}
@@ -3379,6 +3554,7 @@ func startHTTPServer(port int) error {
 	}
 	actualPort := ln.Addr().(*net.TCPAddr).Port
 	currentPort = actualPort
+	writeInstanceLockFile(actualPort)
 
 	srv := &http.Server{
 		Handler:           buildHTTPMux(),
@@ -3404,7 +3580,9 @@ func restartHTTPServer(newPort int) error {
 	srvMutex.Unlock()
 
 	if oldSrv != nil {
-		_ = oldSrv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = oldSrv.Shutdown(ctx)
+		cancel()
 	}
 	return startHTTPServer(newPort)
 }
@@ -3484,10 +3662,24 @@ func main() {
 	if err := initDirectoriesAndConfig(); err != nil {
 		log.Fatalf("初始化目录与配置失败: %v", err)
 	}
+
+	// 单实例检测：若已有后台实例运行，直接唤起其主页并静默退出
+	if running, activePort := checkAndAcquireSingleInstance(appCfg.Port); running {
+		client := &http.Client{Timeout: 800 * time.Millisecond}
+		if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/instance/ping?wake=1", activePort)); err == nil {
+			_ = resp.Body.Close()
+		} else {
+			openBrowser(fmt.Sprintf("http://127.0.0.1:%d", activePort))
+		}
+		return
+	}
+
 	if err := initDatabase(); err != nil {
+		removeInstanceLockFile()
 		log.Fatalf("初始化数据库失败: %v", err)
 	}
 	if err := startHTTPServer(appCfg.Port); err != nil {
+		removeInstanceLockFile()
 		log.Fatalf("启动端口 %d 失败（可能被占用）: %v", appCfg.Port, err)
 	}
 
@@ -3509,11 +3701,11 @@ func onSystrayReady() {
 	pid := os.Getpid()
 	systray.SetTooltip(fmt.Sprintf("企业办公用品与类资产台账系统\n进程: %s (PID: %d)\n端口: %d", exeName, pid, currentPort))
 
-	mInfo := systray.AddMenuItem(fmt.Sprintf("🟢 运行中: %s (PID:%d | 端口:%d)", exeName, pid, currentPort), "在任务管理器【详细信息】标签页按此名称定位后台进程")
+	mInfo := systray.AddMenuItem(fmt.Sprintf("🟢 运行中: %s (PID:%d | 端口:%d)", exeName, pid, currentPort), "系统单实例运行中")
 	mInfo.Disable()
 	systray.AddSeparator()
 
-	mOpen := systray.AddMenuItem("🌐 打开台账管理主页 (本机管理员)", "在浏览器中打开系统")
+	mOpen := systray.AddMenuItem("🌐 打开台账管理主页", "在浏览器中打开系统")
 	mFolder := systray.AddMenuItem("📁 打开附件与数据文件夹", "查看归档的月度手写表与资产图片")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("❌ 退出系统", "安全关闭服务与数据库")
@@ -3537,9 +3729,13 @@ func onSystrayReady() {
 
 func onSystrayExit() {
 	if httpSrv != nil {
-		_ = httpSrv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = httpSrv.Shutdown(ctx)
+		cancel()
 	}
 	if db != nil {
+		_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
 		_ = db.Close()
 	}
+	removeInstanceLockFile()
 }
