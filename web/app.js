@@ -25,6 +25,62 @@ function yearStartStr() {
   return `${new Date().getFullYear()}-01-01`;
 }
 
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// 将后端返回的组合指纹（IP [主机名:xxx | MAC:xxx] (系统 · 浏览器)）格式化为紧凑两行
+function formatClientSourceTwoLines(raw) {
+  if (!raw) return '-';
+  const text = String(raw).trim();
+  if (text.includes('(主机本机)') || text === '127.0.0.1' || text === '系统内部') {
+    return `<div style="line-height:1.35;"><div><strong>127.0.0.1</strong></div><div style="font-size:11px;color:#64748b;">主机本机</div></div>`;
+  }
+
+  let ipPart = text;
+  let hostName = '';
+  let macAddr = '';
+  let envPart = '';
+
+  const bracketMatch = text.match(/\[(.*?)\]/);
+  if (bracketMatch) {
+    ipPart = text.slice(0, bracketMatch.index).trim();
+    const hwItems = bracketMatch[1].split('|').map(s => s.trim());
+    hwItems.forEach(item => {
+      if (item.startsWith('主机名:')) hostName = item.replace('主机名:', '').trim();
+      else if (item.startsWith('MAC:')) macAddr = item.trim();
+    });
+  } else {
+    const parenIdx = text.indexOf('(');
+    if (parenIdx > 0) ipPart = text.slice(0, parenIdx).trim();
+  }
+
+  const parenMatch = text.match(/\(([^()]+)\)\s*$/);
+  if (parenMatch) {
+    envPart = parenMatch[1].trim();
+  }
+
+  const line1 = hostName
+    ? `<strong>${escapeHtml(ipPart)}</strong> · <span style="color:#0f172a;font-weight:600;">${escapeHtml(hostName)}</span>`
+    : `<strong>${escapeHtml(ipPart)}</strong>`;
+
+  const subParts = [];
+  if (macAddr) subParts.push(escapeHtml(macAddr));
+  if (envPart) subParts.push(escapeHtml(envPart));
+  const line2 = subParts.length > 0 ? subParts.join(' · ') : '局域网终端';
+
+  return `
+    <div style="line-height:1.38;white-space:nowrap;">
+      <div>${line1}</div>
+      <div style="font-size:11px;color:#64748b;">${line2}</div>
+    </div>
+  `;
+}
+
 async function apiFetch(url, options = {}) {
   const headers = options.headers || {};
   if (authState.token) {
@@ -138,7 +194,8 @@ async function loadItems() {
   const cats = [...new Set(allItems.map(i => i.category))];
   const catOptions = '<option value="">全部分类</option>' + cats.map(c => `<option value="${c}">${c}</option>`).join('');
   document.getElementById('inv-category').innerHTML = catOptions;
-  document.getElementById('ra-category').innerHTML = catOptions;  document.getElementById('cat-datalist').innerHTML = cats.map(c => `<option value="${c}">`).join('');
+  document.getElementById('ra-category').innerHTML = catOptions;
+  document.getElementById('cat-datalist').innerHTML = cats.map(c => `<option value="${c}">`).join('');
 
   onInvCategoryChange();
   renderDictTable();
@@ -1143,11 +1200,11 @@ async function loadAuditLogs() {
   const res = await resp.json();
   document.getElementById('tbody-audit-logs').innerHTML = (res.data || []).map(l => `
     <tr>
-      <td>${l.created_at}</td>
-      <td><code>${l.client_ip || '-'}</code></td>
-      <td><strong>${l.action}</strong></td>
-      <td>${l.target_info}</td>
-      <td style="white-space:normal;text-align:left;">${l.detail}</td>
+      <td>${escapeHtml(l.created_at)}</td>
+      <td>${formatClientSourceTwoLines(l.client_ip)}</td>
+      <td><strong>${escapeHtml(l.action)}</strong></td>
+      <td>${escapeHtml(l.target_info)}</td>
+      <td style="white-space:normal;text-align:left;">${escapeHtml(l.detail)}</td>
     </tr>
   `).join('');
 }
@@ -1222,12 +1279,12 @@ function openPrintPreview(mode) {
   const area = document.getElementById('print-preview-area');
   area.innerHTML = `
     <div id="print-sheet-wrapper" style="transform-origin:top left;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:6px;font-size:13px;color:#334155;">
+      <div style="text-align:center;margin-bottom:10px;">
+        <h2 id="print-title-display" style="font-size:20px;font-weight:700;color:#0f172a;letter-spacing:0.5px;margin:0;"></h2>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:8px;font-size:13px;color:#334155;">
         <div><strong>单位/部门：</strong><span id="print-org-display"></span></div>
         <div>${subRightMeta}</div>
-      </div>
-      <div style="text-align:center;margin-bottom:12px;">
-        <h2 id="print-title-display" style="font-size:19px;margin-bottom:4px;"></h2>
       </div>
       <div id="print-cards-container" class="hidden" style="margin-bottom:12px;">${cardsHtml}</div>
       ${tableHtml}
