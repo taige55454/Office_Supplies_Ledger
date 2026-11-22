@@ -332,7 +332,7 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	}
 
 	// =========================================================================
-	// 模块 8：审计日志 IP 校验与全部 5 种 Excel 导出（含审计日志导出）
+	// 模块 8：审计日志溯源与全部 5 种 Excel 导出（含流水账与审计日志的操作来源终端信息）
 	// =========================================================================
 	_, auditRes := doJSONReq(t, http.MethodGet, baseURL+"/api/audit-logs", adminToken, nil)
 	auditList := auditRes["data"].([]interface{})
@@ -364,8 +364,8 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	xlAudit := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=audit_logs", baseURL))
 	defer xlAudit.Close()
 	ipColHeader, _ := xlAudit.GetCellValue("敏感修改审计日志", "B3")
-	if ipColHeader != "操作来源 IP" {
-		t.Fatalf("审计日志 Excel 导出表头 B3 应为操作来源 IP，实际: %s", ipColHeader)
+	if !strings.Contains(ipColHeader, "操作来源终端") {
+		t.Fatalf("审计日志 Excel 导出表头 B3 应包含操作来源终端，实际: %s", ipColHeader)
 	}
 
 	xlInv := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_inventory&hide_zero=1", baseURL))
@@ -379,8 +379,10 @@ func TestFullBusiness100PercentCoverage(t *testing.T) {
 	xlLed := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=consumable_ledger", baseURL))
 	defer xlLed.Close()
 	hCode, _ := xlLed.GetCellValue("消耗品接续流水账", "C3")
-	if hCode != "用品编码" {
-		t.Fatalf("流水账 Excel 列头校验失败: C3=%s", hCode)
+	hSrc, _ := xlLed.GetCellValue("消耗品接续流水账", "R3")
+	vSrc, _ := xlLed.GetCellValue("消耗品接续流水账", "R4")
+	if hCode != "用品编码" || !strings.Contains(hSrc, "操作来源终端") || !strings.Contains(vSrc, "127.0.0.1") {
+		t.Fatalf("流水账 Excel 列头或操作来源终端校验失败: C3=%s, R3=%s, R4=%s", hCode, hSrc, vSrc)
 	}
 
 	xlAst := fetchExcel(fmt.Sprintf("%s/api/export/excel?mode=reusable_assets", baseURL))
