@@ -1375,7 +1375,22 @@ function applyPrintLayout() {
     styleTag.id = 'dynamic-print-page-style';
     document.head.appendChild(styleTag);
   }
-  styleTag.textContent = `@media print { @page { size: A4 ${orient}; margin: 10mm; } }`;
+  styleTag.textContent = `
+    @media print {
+      @page {
+        size: A4 ${orient};
+        margin: 10mm 10mm 14mm 10mm;
+        @bottom-center {
+          content: "第 " counter(page) " 页 / 共 " counter(pages) " 页";
+          font-size: 9pt;
+          color: #475569;
+          font-family: "Microsoft YaHei", sans-serif;
+          vertical-align: top;
+          padding-top: 4mm;
+        }
+      }
+    }
+  `;
 
   wrapper.style.zoom = '1';
   wrapper.style.width = 'max-content';
